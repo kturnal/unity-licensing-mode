@@ -1,0 +1,432 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+
+resolve_script_dir() {
+  local source="${BASH_SOURCE[0]}"
+  while [[ -L "$source" ]]; do
+    local source_dir
+    source_dir="$(cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd)"
+    source="$(readlink "$source")"
+    [[ "$source" == /* ]] || source="$source_dir/$source"
+  done
+
+  cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd
+}
+
+SCRIPT_DIR="$(resolve_script_dir)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd)"
+CONFIG_FILE="${UNITY_LICENSING_MODE_CONFIG_FILE:-$PROJECT_DIR/config/local.conf}"
+LICENSE_CLIENT_PATTERN='/Unity\.Licensing\.Client( |$)'
+
+USER_CONFIG_DIR="$HOME/Library/Application Support/Unity/config"
+USER_CONFIG="$USER_CONFIG_DIR/services-config.json"
+SYSTEM_CONFIG_DIR="/Library/Application Support/Unity/config"
+SYSTEM_CONFIG="$SYSTEM_CONFIG_DIR/services-config.json"
+
+LICENSE_DIR="$HOME/Library/Unity/licenses"
+PERSONAL_LICENSE="$LICENSE_DIR/UnityEntitlementLicense.xml"
+ZT_NETWORK_ID=""
+ZT_NETWORK_NAME=""
+LICENSE_SERVER_URL=""
+UNITY_LICENSE_CLI=""
+
+MANAGED_DIR="${UNITY_LICENSING_MODE_STATE_DIR:-$PROJECT_DIR/runtime}"
+USER_DISABLED="$MANAGED_DIR/services-config.user.disabled.json"
+SYSTEM_DISABLED="$MANAGED_DIR/services-config.system.disabled.json"
+FLOATING_TEMPLATE="$MANAGED_DIR/services-config.floating.template.json"
+
+read_config_value() {
+  local key="$1"
+  [[ -f "$CONFIG_FILE" ]] || return 0
+
+  awk -v key="$key" '
+    /^[[:space:]]*(#|$)/ { next }
+    {
+      line = $0
+      sub(/^[[:space:]]*/, "", line)
+      equals = index(line, "=")
+      if (equals == 0) next
+
+      name = substr(line, 1, equals - 1)
+      gsub(/[[:space:]]/, "", name)
+      if (name != key) next
+
+      value = substr(line, equals + 1)
+      sub(/^[[:space:]]*/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      if (value ~ /^".*"$/) {
+        sub(/^"/, "", value)
+        sub(/"$/, "", value)
+      }
+
+      print value
+      exit
+    }
+  ' "$CONFIG_FILE"
+}
+
+load_configuration() {
+  local configured_license_cli
+
+  ZT_NETWORK_ID="${UNITY_ZEROTIER_NETWORK_ID:-$(read_config_value UNITY_ZEROTIER_NETWORK_ID)}"
+  ZT_NETWORK_NAME="${UNITY_ZEROTIER_NETWORK_NAME:-$(read_config_value UNITY_ZEROTIER_NETWORK_NAME)}"
+  LICENSE_SERVER_URL="${UNITY_LICENSE_SERVER_URL:-$(read_config_value UNITY_LICENSE_SERVER_URL)}"
+
+  configured_license_cli="$(read_config_value UNITY_LICENSE_CLI)"
+  UNITY_LICENSE_CLI="${UNITY_LICENSE_CLI:-${configured_license_cli:-/usr/local/bin/unity-license}}"
+}
+
+load_configuration
+
+
+
+timestamp() {
+  date +"%Y%m%d-%H%M%S"
+}
+
+say() {
+  printf '%s\n' "$*"
+}
+
+warn() {
+  printf 'warning: %s\n' "$*" >&2
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+require_floating_configuration() {
+  [[ -n "$ZT_NETWORK_ID" ]] || die "Missing UNITY_ZEROTIER_NETWORK_ID in $CONFIG_FILE."
+  [[ -n "$ZT_NETWORK_NAME" ]] || die "Missing UNITY_ZEROTIER_NETWORK_NAME in $CONFIG_FILE."
+  [[ -n "$LICENSE_SERVER_URL" ]] || die "Missing UNITY_LICENSE_SERVER_URL in $CONFIG_FILE."
+}
+
+path_needs_root() {
+  [[ "$1" == /Library/* ]]
+}
+
+ensure_dir() {
+  local dir="$1"
+  if path_needs_root "$dir"; then
+    sudo mkdir -p "$dir"
+  else
+    mkdir -p "$dir"
+  fi
+}
+
+copy_file() {
+  local src="$1"
+  local dst="$2"
+  if path_needs_root "$src" || path_needs_root "$dst"; then
+    sudo cp "$src" "$dst"
+  else
+    cp "$src" "$dst"
+  fi
+}
+
+move_file() {
+  local src="$1"
+  local dst="$2"
+  if path_needs_root "$src" || path_needs_root "$dst"; then
+    sudo mv "$src" "$dst"
+  else
+    mv "$src" "$dst"
+  fi
+}
+
+archive_existing() {
+  local path="$1"
+  if [[ -f "$path" ]]; then
+    copy_file "$path" "${path}.$(timestamp)"
+  fi
+}
+
+disable_config() {
+  local active="$1"
+  local backup="$2"
+  if [[ ! -f "$active" ]]; then
+    return
+  fi
+
+  ensure_dir "$(dirname "$backup")"
+  archive_existing "$backup"
+  move_file "$active" "$backup"
+  say "Disabled $(basename "$active") -> $backup"
+}
+
+seed_template_if_missing() {
+  local required="${1:-required}"
+  local candidate
+  local -a candidates=()
+
+  if [[ -f "$FLOATING_TEMPLATE" ]]; then
+    return
+  fi
+
+  shopt -s nullglob
+  candidates+=(
+    "$SYSTEM_CONFIG"
+    "$SYSTEM_DISABLED"
+    "$SYSTEM_CONFIG_DIR"/services-config.json*.bak
+    "$USER_CONFIG"
+    "$USER_DISABLED"
+    "$USER_CONFIG_DIR"/services-config.json*.bak
+  )
+  shopt -u nullglob
+
+  for candidate in "${candidates[@]}"; do
+    [[ -f "$candidate" ]] || continue
+    ensure_dir "$MANAGED_DIR"
+    copy_file "$candidate" "$FLOATING_TEMPLATE"
+    say "Seeded floating template from $candidate"
+    return
+  done
+
+  if [[ "$required" == "required" ]]; then
+    die "Could not find any Unity floating config to preserve as a template."
+  fi
+
+  warn "No Unity floating config was found to preserve as a template."
+}
+
+unity_running() {
+  pgrep -f "/Applications/Unity Hub.app|/Applications/Unity/Hub/Editor/.*/Unity.app" >/dev/null 2>&1
+}
+
+licensing_client_pids() {
+  pgrep -f "$LICENSE_CLIENT_PATTERN" || true
+}
+
+stop_licensing_client() {
+  local pids
+  pids="$(licensing_client_pids)"
+
+  if [[ -z "$pids" ]]; then
+    say "Unity licensing client is not running."
+    return
+  fi
+
+  say "Stopping Unity licensing client (PIDs: $(tr '\n' ' ' <<<"$pids"))"
+  # shellcheck disable=SC2086
+  kill -TERM $pids >/dev/null 2>&1 || true
+
+  local attempt
+  for attempt in {1..15}; do
+    if [[ -z "$(licensing_client_pids)" ]]; then
+      say "Unity licensing client stopped."
+      return
+    fi
+    sleep 1
+  done
+
+  warn "Unity licensing client is still running; close Unity Hub and retry before opening a project."
+}
+
+quit_unity() {
+  osascript -e 'tell application "Unity Hub" to quit' >/dev/null 2>&1 || true
+  osascript -e 'tell application "Unity" to quit' >/dev/null 2>&1 || true
+
+  local attempt
+  for attempt in {1..15}; do
+    if ! unity_running; then
+      say "Unity Hub and Editor are not running."
+      return
+    fi
+    sleep 1
+  done
+
+  die "Unity Hub or Unity Editor is still running. Save and close it manually before changing licenses."
+}
+
+zerotier_status() {
+  if ! command -v zerotier-cli >/dev/null 2>&1; then
+    say "ZeroTier: zerotier-cli not found"
+    return
+  fi
+
+  if [[ -z "$ZT_NETWORK_ID" ]]; then
+    say "ZeroTier: network not configured ($CONFIG_FILE)"
+    return
+  fi
+
+  local status_line
+  status_line="$(zerotier-cli listnetworks 2>/dev/null | awk -v nwid="$ZT_NETWORK_ID" '$3 == nwid {print $0}')"
+
+  if [[ -z "$status_line" ]]; then
+    say "ZeroTier: not joined to $ZT_NETWORK_NAME ($ZT_NETWORK_ID)"
+    return
+  fi
+
+  say "ZeroTier: $status_line"
+}
+
+ensure_zerotier_managed_routes() {
+  if ! command -v zerotier-cli >/dev/null 2>&1; then
+    die "ZeroTier CLI not found; cannot enable the floating licensing route."
+  fi
+
+  local status_line
+  status_line="$(zerotier-cli listnetworks 2>/dev/null | awk -v nwid="$ZT_NETWORK_ID" '$3 == nwid {print $0}')"
+  if [[ -z "$status_line" ]]; then
+    die "ZeroTier is not currently joined to $ZT_NETWORK_NAME ($ZT_NETWORK_ID)."
+  fi
+
+  local allow_managed
+  allow_managed="$(zerotier-cli get "$ZT_NETWORK_ID" allowManaged 2>/dev/null || true)"
+  if [[ "$allow_managed" != "1" ]]; then
+    say "Enabling ZeroTier managed routes for $ZT_NETWORK_NAME."
+    zerotier-cli set "$ZT_NETWORK_ID" allowManaged=1
+  fi
+}
+
+verify_floating_config() {
+  [[ -f "$SYSTEM_CONFIG" ]] || die "Floating Unity config was not installed at $SYSTEM_CONFIG."
+  [[ ! -f "$USER_CONFIG" ]] || die "User-level Unity config is still active at $USER_CONFIG."
+
+  if command -v jq >/dev/null 2>&1; then
+    local endpoint
+    endpoint="$(jq -r '.licensingServiceBaseUrl // empty' "$SYSTEM_CONFIG" 2>/dev/null || true)"
+    [[ "$endpoint" == "$LICENSE_SERVER_URL" ]] || die "Floating Unity config has an unexpected licensing endpoint."
+  fi
+}
+
+print_status() {
+  local floating_count
+  local latest_floating
+  local configuration_state="incomplete"
+
+  if [[ -n "$ZT_NETWORK_ID" && -n "$ZT_NETWORK_NAME" && -n "$LICENSE_SERVER_URL" ]]; then
+    configuration_state="configured"
+  fi
+
+  say "Unity licensing mode status"
+  say "Configuration file: $CONFIG_FILE"
+  say "Floating configuration: $configuration_state"
+  say "User config active: $([[ -f "$USER_CONFIG" ]] && echo yes || echo no)"
+  say "System config active: $([[ -f "$SYSTEM_CONFIG" ]] && echo yes || echo no)"
+  say "User config backup: $([[ -f "$USER_DISABLED" ]] && echo "$USER_DISABLED" || echo no)"
+  say "System config backup: $([[ -f "$SYSTEM_DISABLED" ]] && echo "$SYSTEM_DISABLED" || echo no)"
+  say "Floating template: $([[ -f "$FLOATING_TEMPLATE" ]] && echo "$FLOATING_TEMPLATE" || echo no)"
+  say "Personal license: $([[ -f "$PERSONAL_LICENSE" ]] && echo "$PERSONAL_LICENSE" || echo no)"
+  local licensing_client
+  licensing_client="$(licensing_client_pids | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+  say "Licensing client running: ${licensing_client:-no}"
+
+  floating_count="$(find "$LICENSE_DIR" -maxdepth 1 -type f -name '*.xml' ! -name 'UnityEntitlementLicense.xml' 2>/dev/null | wc -l | tr -d ' ')"
+  latest_floating="$(find "$LICENSE_DIR" -maxdepth 1 -type f -name '*.xml' ! -name 'UnityEntitlementLicense.xml' 2>/dev/null | sort | tail -n 1)"
+  say "Floating lease files: ${floating_count:-0}"
+  if [[ -n "$latest_floating" ]]; then
+    say "Latest floating lease: $latest_floating"
+  fi
+
+  zerotier_status
+}
+
+activate_floating_mode() {
+  require_floating_configuration
+  quit_unity
+  stop_licensing_client
+  seed_template_if_missing required
+  ensure_zerotier_managed_routes
+
+  disable_config "$USER_CONFIG" "$USER_DISABLED"
+  disable_config "$SYSTEM_CONFIG" "$SYSTEM_DISABLED"
+
+  ensure_dir "$SYSTEM_CONFIG_DIR"
+  copy_file "$FLOATING_TEMPLATE" "$SYSTEM_CONFIG"
+  verify_floating_config
+
+  say "Floating licensing mode is active."
+  say "Unity licensing client will reload this mode when Unity Hub or the Editor starts."
+}
+
+activate_personal_mode() {
+  quit_unity
+  stop_licensing_client
+  seed_template_if_missing optional
+
+  disable_config "$USER_CONFIG" "$USER_DISABLED"
+  disable_config "$SYSTEM_CONFIG" "$SYSTEM_DISABLED"
+
+  say "Personal mode is active."
+  say "Next: sign into your private Unity account and open Unity normally."
+}
+
+return_floating() {
+  local token="${1:-}"
+  [[ -n "$token" ]] || die "Usage: $SCRIPT_NAME return-floating <token>"
+  [[ -x "$UNITY_LICENSE_CLI" ]] || die "unity-license CLI not found at $UNITY_LICENSE_CLI"
+
+  quit_unity
+  stop_licensing_client
+  "$UNITY_LICENSE_CLI" --return-floating "$token"
+}
+
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME <command>
+
+Commands:
+  status
+      Show current Unity mode inputs: active configs, backups, licenses, and ZeroTier state.
+
+  personal
+      Disable floating licensing cleanly by backing up any active Unity services-config.json files.
+      This keeps your local personal license path active and preserves a floating template for later.
+
+  floating
+      Enable floating licensing by restoring the preserved floating template to:
+      /Library/Application Support/Unity/config/services-config.json
+      This also disables the user-level Unity services-config.json to avoid duplicate config sources.
+
+  reload-client
+      Stop the running Unity licensing client so it reloads the selected mode on next Unity start.
+
+  return-floating <token>
+      Close Unity and return a floating lease using the unity-license CLI.
+
+Notes:
+  - This script never deletes Unity config files. It only copies or moves them into backups.
+  - Commands that touch /Library will prompt for sudo.
+  - Copy config/example.conf to config/local.conf and fill in your private values.
+  - The local config and runtime state are ignored by Git.
+  - The preserved floating template lives at:
+      $FLOATING_TEMPLATE
+EOF
+}
+
+main() {
+  local command="${1:-status}"
+  shift || true
+
+  case "$command" in
+    status)
+      print_status
+      ;;
+    personal)
+      activate_personal_mode
+      ;;
+    floating)
+      activate_floating_mode
+      ;;
+    reload-client)
+      stop_licensing_client
+      ;;
+    return-floating)
+      return_floating "${1:-}"
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

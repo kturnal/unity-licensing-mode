@@ -1,0 +1,14 @@
+.DS_Store
+
+# Private local configuration
+config/local.conf
+
+# Unity licensing state, backups, and lease-related files
+runtime/
+
+# Local logs and environment files
+*.log
+*.log.*
+.env
+.env.*
+!.env.example
