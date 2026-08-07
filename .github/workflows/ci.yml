@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'feat/**'
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell:
+    name: Bash and ShellCheck (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install ShellCheck on Ubuntu
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y shellcheck
+
+      - name: Install ShellCheck on macOS
+        if: runner.os == 'macOS'
+        run: brew install shellcheck
+
+      - name: Install ShellCheck on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install shellcheck --no-progress --yes
+
+      - name: Run ShellCheck
+        shell: bash
+        run: shellcheck bin/unity-licensing-mode tests/*.sh
+
+      - name: Scan tracked source for high-confidence credential markers
+        shell: bash
+        run: |
+          if git grep -n -E '-----BEGIN (RSA|OPENSSH|EC) PRIVATE KEY-----|sk-[A-Za-z0-9]{20,}' -- .; then
+            echo 'credential marker found in tracked source' >&2
+            exit 1
+          fi
+
+      - name: Run fixture tests
+        shell: bash
+        run: |
+          bash -n bin/unity-licensing-mode
+          bash tests/test-command.sh
+          bash tests/test-fixtures.sh
+          bash tests/test-release.sh
+          git diff --check

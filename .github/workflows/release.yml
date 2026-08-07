@@ -1,0 +1,31 @@
+name: Release validation
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Verify tag and version identity
+        run: bash tests/test-release.sh "$GITHUB_REF_NAME"
+
+      - name: Build and inspect source archive
+        run: |
+          version_tag="$(printf '%s' "$GITHUB_REF_NAME" | sed 's/^v//')"
+          archive="unity-licensing-mode-$version_tag.tar.gz"
+          git archive --format=tar.gz --prefix="unity-licensing-mode-$version_tag/" "$GITHUB_REF_NAME" > "$archive"
+          if tar -tzf "$archive" | grep -E '(^|/)(config/local.conf|runtime/|.*\.log$|.*\.xml$)'; then
+            echo 'private runtime or log content found in release archive' >&2
+            exit 1
+          fi
+          sha256sum "$archive"

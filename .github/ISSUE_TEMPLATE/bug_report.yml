@@ -1,0 +1,49 @@
+name: Bug report
+description: Report a reproducible problem with the command-line helper
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include private URLs, network IDs, license files, tokens, or unredacted logs.
+  - type: input
+    id: version
+    attributes:
+      label: unity-licensing-mode version
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: macOS version
+      placeholder: macOS 15.x
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and redacted output
+      description: Include the exact command, exit status, and redacted status or doctor output.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
