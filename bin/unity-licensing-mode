@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 
@@ -17,25 +17,153 @@ resolve_script_dir() {
 
 SCRIPT_DIR="$(resolve_script_dir)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd)"
-CONFIG_FILE="${UNITY_LICENSING_MODE_CONFIG_FILE:-$PROJECT_DIR/config/local.conf}"
-LICENSE_CLIENT_PATTERN='/Unity\.Licensing\.Client( |$)'
+VERSION_FILE="$PROJECT_DIR/VERSION"
+PLATFORM="${UNITY_LICENSING_MODE_PLATFORM:-$(uname -s 2>/dev/null || printf 'unknown')}"
+USER_HOME="${HOME:-}"
 
-USER_CONFIG_DIR="$HOME/Library/Application Support/Unity/config"
+if [[ -z "$USER_HOME" ]]; then
+  printf 'error: HOME is not set.\n' >&2
+  exit 1
+fi
+
+say() {
+  printf '%s\n' "$*"
+}
+
+warn() {
+  printf 'warning: %s\n' "$*" >&2
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+timestamp() {
+  date +"%Y%m%d-%H%M%S"
+}
+
+is_source_checkout() {
+  [[ -e "$PROJECT_DIR/.git" && -f "$PROJECT_DIR/config/example.conf" ]]
+}
+
+default_config_file() {
+  if is_source_checkout; then
+    printf '%s\n' "$PROJECT_DIR/config/local.conf"
+    return
+  fi
+
+  case "$PLATFORM" in
+    Darwin)
+      printf '%s\n' "$USER_HOME/Library/Application Support/unity-licensing-mode/config.conf"
+      ;;
+    Linux)
+      printf '%s\n' "${XDG_CONFIG_HOME:-$USER_HOME/.config}/unity-licensing-mode/config.conf"
+      ;;
+    *)
+      printf '%s\n' "${XDG_CONFIG_HOME:-$USER_HOME/.config}/unity-licensing-mode/config.conf"
+      ;;
+  esac
+}
+
+default_state_dir() {
+  if is_source_checkout; then
+    printf '%s\n' "$PROJECT_DIR/runtime"
+    return
+  fi
+
+  case "$PLATFORM" in
+    Darwin)
+      printf '%s\n' "$USER_HOME/Library/Application Support/unity-licensing-mode"
+      ;;
+    Linux)
+      printf '%s\n' "${XDG_STATE_HOME:-$USER_HOME/.local/state}/unity-licensing-mode"
+      ;;
+    *)
+      printf '%s\n' "${XDG_STATE_HOME:-$USER_HOME/.local/state}/unity-licensing-mode"
+      ;;
+  esac
+}
+
+default_user_config_dir() {
+  case "$PLATFORM" in
+    Darwin)
+      printf '%s\n' "$USER_HOME/Library/Application Support/Unity/config"
+      ;;
+    Linux)
+      printf '%s\n' "${XDG_CONFIG_HOME:-$USER_HOME/.config}/unity3d/config"
+      ;;
+    *)
+      printf '%s\n' "${XDG_CONFIG_HOME:-$USER_HOME/.config}/unity3d/config"
+      ;;
+  esac
+}
+
+default_system_config_dir() {
+  case "$PLATFORM" in
+    Darwin)
+      printf '%s\n' "/Library/Application Support/Unity/config"
+      ;;
+    Linux)
+      printf '%s\n' "/usr/share/unity3d/config"
+      ;;
+    *)
+      printf '%s\n' "/usr/share/unity3d/config"
+      ;;
+  esac
+}
+
+default_license_dir() {
+  case "$PLATFORM" in
+    Darwin)
+      printf '%s\n' "$USER_HOME/Library/Unity/licenses"
+      ;;
+    Linux)
+      printf '%s\n' "${XDG_DATA_HOME:-$USER_HOME/.local/share}/unity3d/licenses"
+      ;;
+    *)
+      printf '%s\n' "${XDG_DATA_HOME:-$USER_HOME/.local/share}/unity3d/licenses"
+      ;;
+  esac
+}
+
+CONFIG_FILE="${UNITY_LICENSING_MODE_CONFIG_FILE:-$(default_config_file)}"
+MANAGED_DIR="${UNITY_LICENSING_MODE_STATE_DIR:-$(default_state_dir)}"
+LOCK_DIR="${UNITY_LICENSING_MODE_LOCK_DIR:-$MANAGED_DIR/.lock}"
+
+USER_CONFIG_DIR="${UNITY_LICENSING_MODE_USER_CONFIG_DIR:-$(default_user_config_dir)}"
 USER_CONFIG="$USER_CONFIG_DIR/services-config.json"
-SYSTEM_CONFIG_DIR="/Library/Application Support/Unity/config"
+SYSTEM_CONFIG_DIR="${UNITY_LICENSING_MODE_SYSTEM_CONFIG_DIR:-$(default_system_config_dir)}"
 SYSTEM_CONFIG="$SYSTEM_CONFIG_DIR/services-config.json"
 
-LICENSE_DIR="$HOME/Library/Unity/licenses"
-PERSONAL_LICENSE="$LICENSE_DIR/UnityEntitlementLicense.xml"
-ZT_NETWORK_ID=""
-ZT_NETWORK_NAME=""
-LICENSE_SERVER_URL=""
-UNITY_LICENSE_CLI=""
+LICENSE_DIR="${UNITY_LICENSING_MODE_LICENSE_DIR:-$(default_license_dir)}"
+PERSONAL_LICENSE="${UNITY_LICENSING_MODE_PERSONAL_LICENSE:-$LICENSE_DIR/UnityEntitlementLicense.xml}"
 
-MANAGED_DIR="${UNITY_LICENSING_MODE_STATE_DIR:-$PROJECT_DIR/runtime}"
 USER_DISABLED="$MANAGED_DIR/services-config.user.disabled.json"
 SYSTEM_DISABLED="$MANAGED_DIR/services-config.system.disabled.json"
 FLOATING_TEMPLATE="$MANAGED_DIR/services-config.floating.template.json"
+
+LICENSE_CLIENT_PATTERN='/Unity\.Licensing\.Client( |$)'
+MODE_CHANGE_TIMEOUT_SECONDS="${UNITY_LICENSING_MODE_TIMEOUT_SECONDS:-15}"
+SERVER_CONNECT_TIMEOUT_SECONDS="${UNITY_LICENSING_MODE_SERVER_CONNECT_TIMEOUT:-5}"
+SERVER_MAX_TIME_SECONDS="${UNITY_LICENSING_MODE_SERVER_MAX_TIME:-8}"
+
+VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || true)"
+DRY_RUN=0
+OUTPUT_FORMAT="text"
+CONFIG_PERMISSION_STATE="missing"
+NETWORK_PROVIDER=""
+ZT_NETWORK_ID=""
+ZT_NETWORK_NAME=""
+LICENSE_SERVER_URL=""
+NETWORK_ALLOW_CHANGES=""
+UNITY_LICENSE_CLI=""
+UNITY_LICENSE_CLI_MODE=""
+
+TRANSACTION_DIR=""
+TRANSACTION_ACTIVE=0
+LOCK_ACQUIRED=0
+DOCTOR_ISSUES=0
 
 read_config_value() {
   local key="$1"
@@ -67,50 +195,103 @@ read_config_value() {
   ' "$CONFIG_FILE"
 }
 
+config_file_mode() {
+  local mode=""
+  [[ -f "$CONFIG_FILE" ]] || {
+    printf 'missing\n'
+    return
+  }
+
+  mode="$(stat -f '%Lp' "$CONFIG_FILE" 2>/dev/null || true)"
+  if [[ -z "$mode" ]]; then
+    mode="$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null || true)"
+  fi
+
+  if [[ "$mode" =~ ^0?[0-7]{3,4}$ ]]; then
+    while [[ "${#mode}" -gt 3 ]]; do
+      mode="${mode#?}"
+    done
+    printf '%s\n' "$mode"
+  else
+    printf 'unknown\n'
+  fi
+}
+
+config_permissions_state() {
+  local mode
+  mode="$(config_file_mode)"
+  case "$mode" in
+    missing)
+      printf 'missing\n'
+      ;;
+    unknown)
+      printf 'unknown\n'
+      ;;
+    *)
+      if [[ "${mode:1:2}" == "00" ]]; then
+        printf 'secure\n'
+      else
+        printf 'insecure\n'
+      fi
+      ;;
+  esac
+}
+
 load_configuration() {
-  local configured_license_cli
+  local strict="${1:-0}"
+  local configured_value
+  local legacy_value
 
-  ZT_NETWORK_ID="${UNITY_ZEROTIER_NETWORK_ID:-$(read_config_value UNITY_ZEROTIER_NETWORK_ID)}"
-  ZT_NETWORK_NAME="${UNITY_ZEROTIER_NETWORK_NAME:-$(read_config_value UNITY_ZEROTIER_NETWORK_NAME)}"
-  LICENSE_SERVER_URL="${UNITY_LICENSE_SERVER_URL:-$(read_config_value UNITY_LICENSE_SERVER_URL)}"
+  CONFIG_PERMISSION_STATE="$(config_permissions_state)"
+  if [[ "$CONFIG_PERMISSION_STATE" == "insecure" || "$CONFIG_PERMISSION_STATE" == "unknown" ]]; then
+    if [[ "$strict" == "1" ]]; then
+      die "Configuration file permissions could not be safely validated; restrict $CONFIG_FILE to the current user (for example, chmod 600)."
+    fi
+    return
+  fi
 
-  configured_license_cli="$(read_config_value UNITY_LICENSE_CLI)"
-  UNITY_LICENSE_CLI="${UNITY_LICENSE_CLI:-${configured_license_cli:-/usr/local/bin/unity-license}}"
-}
+  configured_value="$(read_config_value UNITY_NETWORK_PROVIDER)"
+  NETWORK_PROVIDER="${UNITY_NETWORK_PROVIDER:-${configured_value:-zerotier}}"
 
-load_configuration
+  configured_value="$(read_config_value UNITY_NETWORK_ID)"
+  legacy_value="$(read_config_value UNITY_ZEROTIER_NETWORK_ID)"
+  ZT_NETWORK_ID="${UNITY_NETWORK_ID:-${configured_value:-${UNITY_ZEROTIER_NETWORK_ID:-$legacy_value}}}"
 
+  configured_value="$(read_config_value UNITY_NETWORK_NAME)"
+  legacy_value="$(read_config_value UNITY_ZEROTIER_NETWORK_NAME)"
+  ZT_NETWORK_NAME="${UNITY_NETWORK_NAME:-${configured_value:-${UNITY_ZEROTIER_NETWORK_NAME:-$legacy_value}}}"
 
+  configured_value="$(read_config_value UNITY_LICENSE_SERVER_URL)"
+  LICENSE_SERVER_URL="${UNITY_LICENSE_SERVER_URL:-$configured_value}"
 
-timestamp() {
-  date +"%Y%m%d-%H%M%S"
-}
+  configured_value="$(read_config_value UNITY_NETWORK_ALLOW_CHANGES)"
+  NETWORK_ALLOW_CHANGES="${UNITY_NETWORK_ALLOW_CHANGES:-${configured_value:-false}}"
 
-say() {
-  printf '%s\n' "$*"
-}
+  configured_value="$(read_config_value UNITY_LICENSE_CLI)"
+  UNITY_LICENSE_CLI="${UNITY_LICENSE_CLI:-${configured_value:-/usr/local/bin/unity-license}}"
 
-warn() {
-  printf 'warning: %s\n' "$*" >&2
-}
-
-die() {
-  printf 'error: %s\n' "$*" >&2
-  exit 1
-}
-
-require_floating_configuration() {
-  [[ -n "$ZT_NETWORK_ID" ]] || die "Missing UNITY_ZEROTIER_NETWORK_ID in $CONFIG_FILE."
-  [[ -n "$ZT_NETWORK_NAME" ]] || die "Missing UNITY_ZEROTIER_NETWORK_NAME in $CONFIG_FILE."
-  [[ -n "$LICENSE_SERVER_URL" ]] || die "Missing UNITY_LICENSE_SERVER_URL in $CONFIG_FILE."
+  configured_value="$(read_config_value UNITY_LICENSE_CLI_MODE)"
+  UNITY_LICENSE_CLI_MODE="${UNITY_LICENSE_CLI_MODE:-${configured_value:-stdin}}"
 }
 
 path_needs_root() {
-  [[ "$1" == /Library/* ]]
+  case "$1" in
+    /Library/*|/usr/share/unity3d/*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 ensure_dir() {
   local dir="$1"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    say "Would create directory: $dir"
+    return
+  fi
+
   if path_needs_root "$dir"; then
     sudo mkdir -p "$dir"
   else
@@ -121,7 +302,17 @@ ensure_dir() {
 copy_file() {
   local src="$1"
   local dst="$2"
-  if path_needs_root "$src" || path_needs_root "$dst"; then
+  if [[ "$DRY_RUN" == "1" ]]; then
+    say "Would copy $src -> $dst"
+    return
+  fi
+
+  if path_needs_root "$src" && ! path_needs_root "$dst"; then
+    sudo cp "$src" "$dst"
+    if command -v id >/dev/null 2>&1; then
+      sudo chown "$(id -u):$(id -g)" "$dst"
+    fi
+  elif path_needs_root "$src" || path_needs_root "$dst"; then
     sudo cp "$src" "$dst"
   else
     cp "$src" "$dst"
@@ -131,18 +322,50 @@ copy_file() {
 move_file() {
   local src="$1"
   local dst="$2"
-  if path_needs_root "$src" || path_needs_root "$dst"; then
+  if [[ "$DRY_RUN" == "1" ]]; then
+    say "Would move $src -> $dst"
+    return
+  fi
+
+  if path_needs_root "$src" && ! path_needs_root "$dst"; then
+    sudo mv "$src" "$dst"
+    if command -v id >/dev/null 2>&1; then
+      sudo chown "$(id -u):$(id -g)" "$dst"
+    fi
+  elif path_needs_root "$src" || path_needs_root "$dst"; then
     sudo mv "$src" "$dst"
   else
     mv "$src" "$dst"
   fi
 }
 
+remove_file() {
+  local path="$1"
+  [[ -e "$path" ]] || return 0
+  if [[ "$DRY_RUN" == "1" ]]; then
+    say "Would remove $path"
+    return
+  fi
+
+  if path_needs_root "$path"; then
+    sudo rm -f "$path"
+  else
+    rm -f "$path"
+  fi
+}
+
 archive_existing() {
   local path="$1"
-  if [[ -f "$path" ]]; then
-    copy_file "$path" "${path}.$(timestamp)"
-  fi
+  local archive_path
+  local attempt=0
+  [[ -f "$path" ]] || return 0
+
+  archive_path="${path}.$(timestamp).bak"
+  while [[ -e "$archive_path" ]]; do
+    attempt=$((attempt + 1))
+    archive_path="${path}.$(timestamp).$attempt.bak"
+  done
+  copy_file "$path" "$archive_path"
 }
 
 disable_config() {
@@ -155,18 +378,123 @@ disable_config() {
   ensure_dir "$(dirname "$backup")"
   archive_existing "$backup"
   move_file "$active" "$backup"
-  say "Disabled $(basename "$active") -> $backup"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    say "Would disable the active Unity configuration."
+  else
+    say "Disabled the active Unity configuration and preserved a backup."
+  fi
 }
 
-seed_template_if_missing() {
-  local required="${1:-required}"
-  local candidate
-  local -a candidates=()
+json_quote() {
+  local value="${1-}"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  printf '"%s"' "$value"
+}
 
-  if [[ -f "$FLOATING_TEMPLATE" ]]; then
-    return
+file_present() {
+  [[ -f "$1" ]]
+}
+
+file_presence_text() {
+  if file_present "$1"; then
+    printf 'present'
+  else
+    printf 'no'
   fi
+}
 
+json_bool_for_file() {
+  if file_present "$1"; then
+    printf 'true'
+  else
+    printf 'false'
+  fi
+}
+
+config_is_complete() {
+  [[ -n "$LICENSE_SERVER_URL" ]] || return 1
+  case "$NETWORK_PROVIDER" in
+    direct)
+      return 0
+      ;;
+    zerotier)
+      [[ -n "$ZT_NETWORK_ID" && -n "$ZT_NETWORK_NAME" ]]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+configuration_state() {
+  if [[ "$CONFIG_PERMISSION_STATE" == "insecure" ]]; then
+    printf 'insecure'
+  elif [[ "$CONFIG_PERMISSION_STATE" == "unknown" ]]; then
+    printf 'unknown'
+  elif config_is_complete; then
+    printf 'configured'
+  elif [[ ! -f "$CONFIG_FILE" && -z "${UNITY_NETWORK_PROVIDER:-}" && -z "${UNITY_LICENSE_SERVER_URL:-}" ]]; then
+    printf 'missing'
+  else
+    printf 'incomplete'
+  fi
+}
+
+validate_network_settings() {
+  case "$NETWORK_PROVIDER" in
+    direct|zerotier)
+      ;;
+    *)
+      die "Unsupported UNITY_NETWORK_PROVIDER; use direct or zerotier."
+      ;;
+  esac
+
+  case "$NETWORK_ALLOW_CHANGES" in
+    true|false)
+      ;;
+    *)
+      die "UNITY_NETWORK_ALLOW_CHANGES must be true or false."
+      ;;
+  esac
+}
+
+require_floating_configuration() {
+  validate_network_settings
+  [[ -n "$LICENSE_SERVER_URL" ]] || die "Missing UNITY_LICENSE_SERVER_URL in $CONFIG_FILE."
+  case "$LICENSE_SERVER_URL" in
+    http://*|https://*)
+      ;;
+    *)
+      die "UNITY_LICENSE_SERVER_URL must use http:// or https://."
+      ;;
+  esac
+
+  if [[ "$NETWORK_PROVIDER" == "zerotier" ]]; then
+    [[ -n "$ZT_NETWORK_ID" ]] || die "Missing UNITY_NETWORK_ID (or legacy UNITY_ZEROTIER_NETWORK_ID) in $CONFIG_FILE."
+    [[ -n "$ZT_NETWORK_NAME" ]] || die "Missing UNITY_NETWORK_NAME (or legacy UNITY_ZEROTIER_NETWORK_NAME) in $CONFIG_FILE."
+  fi
+}
+
+require_json_validator() {
+  command -v jq >/dev/null 2>&1 || die "jq is required to validate Unity floating configuration JSON."
+}
+
+validate_floating_config_file() {
+  local path="$1"
+  [[ -f "$path" ]] || return 1
+  [[ -n "$LICENSE_SERVER_URL" ]] || return 1
+  require_json_validator
+
+  jq -e --arg expected "$LICENSE_SERVER_URL" \
+    'type == "object" and (.licensingServiceBaseUrl | type == "string") and .licensingServiceBaseUrl == $expected' \
+    "$path" >/dev/null 2>&1
+}
+
+template_candidates() {
+  local -a candidates=()
   shopt -s nullglob
   candidates+=(
     "$SYSTEM_CONFIG"
@@ -177,61 +505,86 @@ seed_template_if_missing() {
     "$USER_CONFIG_DIR"/services-config.json*.bak
   )
   shopt -u nullglob
+  printf '%s\n' "${candidates[@]}"
+}
 
-  for candidate in "${candidates[@]}"; do
-    [[ -f "$candidate" ]] || continue
-    ensure_dir "$MANAGED_DIR"
-    copy_file "$candidate" "$FLOATING_TEMPLATE"
-    say "Seeded floating template from $candidate"
+seed_template_if_missing() {
+  local required="${1:-required}"
+  local candidate
+
+  if [[ -f "$FLOATING_TEMPLATE" ]]; then
+    if [[ -n "$LICENSE_SERVER_URL" ]] && ! validate_floating_config_file "$FLOATING_TEMPLATE"; then
+      die "The preserved floating template is not valid JSON for the configured licensing server."
+    fi
     return
-  done
-
-  if [[ "$required" == "required" ]]; then
-    die "Could not find any Unity floating config to preserve as a template."
   fi
 
-  warn "No Unity floating config was found to preserve as a template."
+  if [[ -z "$LICENSE_SERVER_URL" ]]; then
+    if [[ "$required" == "required" ]]; then
+      die "A licensing-server URL is required before a floating template can be validated."
+    fi
+    warn "No floating server URL is configured; no floating template was preserved."
+    return
+  fi
+
+  require_json_validator
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" && -f "$candidate" ]] || continue
+    if validate_floating_config_file "$candidate"; then
+      ensure_dir "$MANAGED_DIR"
+      copy_file "$candidate" "$FLOATING_TEMPLATE"
+      if [[ "$DRY_RUN" == "1" ]]; then
+        say "Would preserve a validated floating template from an existing Unity config."
+      else
+        say "Preserved a validated floating template from an existing Unity config."
+      fi
+      return
+    fi
+  done < <(template_candidates)
+
+  if [[ "$required" == "required" ]]; then
+    die "Could not find a Unity floating config with the configured licensing endpoint."
+  fi
+  warn "No Unity floating config with the configured licensing endpoint was found."
+}
+
+verify_floating_config() {
+  if [[ "$DRY_RUN" == "1" ]]; then
+    say "Would verify the installed floating configuration and its licensing endpoint."
+    return
+  fi
+
+  [[ -f "$SYSTEM_CONFIG" ]] || die "Floating Unity config was not installed at the system configuration path."
+  [[ ! -f "$USER_CONFIG" ]] || die "User-level Unity config is still active."
+  validate_floating_config_file "$SYSTEM_CONFIG" || die "Installed floating Unity config failed JSON or endpoint validation."
 }
 
 unity_running() {
-  pgrep -f "/Applications/Unity Hub.app|/Applications/Unity/Hub/Editor/.*/Unity.app" >/dev/null 2>&1
+  command -v pgrep >/dev/null 2>&1 || return 1
+  pgrep -f '/Applications/Unity Hub.app|/Applications/Unity/Hub/Editor/.*/Unity.app' >/dev/null 2>&1
 }
 
 licensing_client_pids() {
-  pgrep -f "$LICENSE_CLIENT_PATTERN" || true
-}
-
-stop_licensing_client() {
-  local pids
-  pids="$(licensing_client_pids)"
-
-  if [[ -z "$pids" ]]; then
-    say "Unity licensing client is not running."
-    return
-  fi
-
-  say "Stopping Unity licensing client (PIDs: $(tr '\n' ' ' <<<"$pids"))"
-  # shellcheck disable=SC2086
-  kill -TERM $pids >/dev/null 2>&1 || true
-
-  local attempt
-  for attempt in {1..15}; do
-    if [[ -z "$(licensing_client_pids)" ]]; then
-      say "Unity licensing client stopped."
-      return
-    fi
-    sleep 1
-  done
-
-  warn "Unity licensing client is still running; close Unity Hub and retry before opening a project."
+  command -v pgrep >/dev/null 2>&1 || return 0
+  pgrep -f "$LICENSE_CLIENT_PATTERN" 2>/dev/null || true
 }
 
 quit_unity() {
+  if [[ "$DRY_RUN" == "1" ]]; then
+    say "Would close Unity Hub and the Unity Editor."
+    return
+  fi
+  if [[ "${UNITY_LICENSING_MODE_SKIP_PROCESS_ACTIONS:-0}" == "1" ]]; then
+    say "Unity process handling skipped by the test environment."
+    return
+  fi
+  command -v osascript >/dev/null 2>&1 || die "osascript is required to close Unity on macOS."
+
   osascript -e 'tell application "Unity Hub" to quit' >/dev/null 2>&1 || true
   osascript -e 'tell application "Unity" to quit' >/dev/null 2>&1 || true
 
   local attempt
-  for attempt in {1..15}; do
+  for ((attempt = 1; attempt <= MODE_CHANGE_TIMEOUT_SECONDS; attempt++)); do
     if ! unity_running; then
       say "Unity Hub and Editor are not running."
       return
@@ -242,96 +595,612 @@ quit_unity() {
   die "Unity Hub or Unity Editor is still running. Save and close it manually before changing licenses."
 }
 
+stop_licensing_client() {
+  local pids
+  local attempt
+  local pid
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    say "Would stop the Unity Licensing Client."
+    return
+  fi
+  if [[ "${UNITY_LICENSING_MODE_SKIP_PROCESS_ACTIONS:-0}" == "1" ]]; then
+    say "Unity Licensing Client handling skipped by the test environment."
+    return
+  fi
+  command -v pgrep >/dev/null 2>&1 || die "pgrep is required to manage the Unity Licensing Client."
+
+  pids="$(licensing_client_pids)"
+  if [[ -z "$pids" ]]; then
+    say "Unity Licensing Client is not running."
+    return
+  fi
+
+  say "Stopping the Unity Licensing Client."
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    kill -TERM "$pid" >/dev/null 2>&1 || true
+  done <<< "$pids"
+
+  for ((attempt = 1; attempt <= MODE_CHANGE_TIMEOUT_SECONDS; attempt++)); do
+    if [[ -z "$(licensing_client_pids)" ]]; then
+      say "Unity Licensing Client stopped."
+      return
+    fi
+    sleep 1
+  done
+
+  warn "Unity Licensing Client is still running; close Unity Hub and retry before opening a project."
+}
+
+zerotier_cli_available() {
+  command -v zerotier-cli >/dev/null 2>&1
+}
+
+zerotier_joined() {
+  local status_line
+  zerotier_cli_available || return 1
+  [[ -n "$ZT_NETWORK_ID" ]] || return 1
+  status_line="$(zerotier-cli listnetworks 2>/dev/null | awk -v nwid="$ZT_NETWORK_ID" '$3 == nwid {print $0}' || true)"
+  [[ -n "$status_line" ]]
+}
+
+zerotier_managed_state() {
+  local managed
+  if ! zerotier_joined; then
+    printf 'not-joined'
+    return
+  fi
+  managed="$(zerotier-cli get "$ZT_NETWORK_ID" allowManaged 2>/dev/null || true)"
+  if [[ "$managed" == "1" ]]; then
+    printf 'enabled'
+  elif [[ -n "$managed" ]]; then
+    printf 'disabled'
+  else
+    printf 'unknown'
+  fi
+}
+
+zerotier_membership_state() {
+  if [[ "$NETWORK_PROVIDER" != "zerotier" ]]; then
+    printf 'not-applicable'
+  elif ! zerotier_cli_available; then
+    printf 'unavailable'
+  elif [[ -z "$ZT_NETWORK_ID" ]]; then
+    printf 'not-configured'
+  elif zerotier_joined; then
+    printf 'joined'
+  else
+    printf 'not-joined'
+  fi
+}
+
 zerotier_status() {
-  if ! command -v zerotier-cli >/dev/null 2>&1; then
-    say "ZeroTier: zerotier-cli not found"
+  local membership
+  local managed
+
+  if [[ "$NETWORK_PROVIDER" == "direct" ]]; then
+    say "Network provider: direct (existing operating-system route)"
     return
   fi
 
-  if [[ -z "$ZT_NETWORK_ID" ]]; then
-    say "ZeroTier: network not configured ($CONFIG_FILE)"
+  membership="$(zerotier_membership_state)"
+  case "$membership" in
+    unavailable)
+      say "ZeroTier: zerotier-cli not found"
+      ;;
+    not-configured)
+      say "ZeroTier: network is not configured"
+      ;;
+    not-joined)
+      say "ZeroTier: configured network is not joined"
+      ;;
+    joined)
+      managed="$(zerotier_managed_state)"
+      say "ZeroTier: joined (managed routes: $managed)"
+      ;;
+    *)
+      say "ZeroTier: unavailable"
+      ;;
+  esac
+}
+
+ensure_network_provider() {
+  local managed
+
+  case "$NETWORK_PROVIDER" in
+    direct)
+      say "Direct network provider selected; using the existing operating-system route."
+      ;;
+    zerotier)
+      zerotier_cli_available || die "ZeroTier CLI not found; cannot prepare the floating licensing route."
+      zerotier_joined || die "ZeroTier is not joined to the configured licensing network."
+      managed="$(zerotier_managed_state)"
+      if [[ "$managed" != "enabled" ]]; then
+        if [[ "$NETWORK_ALLOW_CHANGES" != "true" ]]; then
+          die "ZeroTier managed routes are disabled; set UNITY_NETWORK_ALLOW_CHANGES=true to opt in to enabling them."
+        fi
+        if [[ "$DRY_RUN" == "1" ]]; then
+          say "Would enable ZeroTier managed routes for the configured licensing network."
+        else
+          say "Enabling ZeroTier managed routes for the configured licensing network."
+          zerotier-cli set "$ZT_NETWORK_ID" allowManaged=1
+        fi
+      fi
+      ;;
+    *)
+      die "Unsupported network provider."
+      ;;
+  esac
+}
+
+server_reachability_state() {
+  if [[ -z "$LICENSE_SERVER_URL" ]]; then
+    printf 'not-configured'
+    return
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    printf 'unavailable'
     return
   fi
 
-  local status_line
-  status_line="$(zerotier-cli listnetworks 2>/dev/null | awk -v nwid="$ZT_NETWORK_ID" '$3 == nwid {print $0}')"
-
-  if [[ -z "$status_line" ]]; then
-    say "ZeroTier: not joined to $ZT_NETWORK_NAME ($ZT_NETWORK_ID)"
-    return
-  fi
-
-  say "ZeroTier: $status_line"
-}
-
-ensure_zerotier_managed_routes() {
-  if ! command -v zerotier-cli >/dev/null 2>&1; then
-    die "ZeroTier CLI not found; cannot enable the floating licensing route."
-  fi
-
-  local status_line
-  status_line="$(zerotier-cli listnetworks 2>/dev/null | awk -v nwid="$ZT_NETWORK_ID" '$3 == nwid {print $0}')"
-  if [[ -z "$status_line" ]]; then
-    die "ZeroTier is not currently joined to $ZT_NETWORK_NAME ($ZT_NETWORK_ID)."
-  fi
-
-  local allow_managed
-  allow_managed="$(zerotier-cli get "$ZT_NETWORK_ID" allowManaged 2>/dev/null || true)"
-  if [[ "$allow_managed" != "1" ]]; then
-    say "Enabling ZeroTier managed routes for $ZT_NETWORK_NAME."
-    zerotier-cli set "$ZT_NETWORK_ID" allowManaged=1
+  if curl --silent --show-error --location \
+    --connect-timeout "$SERVER_CONNECT_TIMEOUT_SECONDS" \
+    --max-time "$SERVER_MAX_TIME_SECONDS" \
+    --output /dev/null "$LICENSE_SERVER_URL" >/dev/null 2>&1; then
+    printf 'reachable'
+  else
+    printf 'unreachable'
   fi
 }
 
-verify_floating_config() {
-  [[ -f "$SYSTEM_CONFIG" ]] || die "Floating Unity config was not installed at $SYSTEM_CONFIG."
-  [[ ! -f "$USER_CONFIG" ]] || die "User-level Unity config is still active at $USER_CONFIG."
+license_file_count() {
+  local count
+  count="$(find "$LICENSE_DIR" -type f -name '*.xml' ! -name 'UnityEntitlementLicense.xml' 2>/dev/null | wc -l | tr -d ' ' || true)"
+  printf '%s' "${count:-0}"
+}
 
-  if command -v jq >/dev/null 2>&1; then
-    local endpoint
-    endpoint="$(jq -r '.licensingServiceBaseUrl // empty' "$SYSTEM_CONFIG" 2>/dev/null || true)"
-    [[ "$endpoint" == "$LICENSE_SERVER_URL" ]] || die "Floating Unity config has an unexpected licensing endpoint."
+licensing_client_running_bool() {
+  if [[ -n "$(licensing_client_pids)" ]]; then
+    printf 'true'
+  else
+    printf 'false'
   fi
 }
 
-print_status() {
+print_status_text() {
   local floating_count
-  local latest_floating
-  local configuration_state="incomplete"
-
-  if [[ -n "$ZT_NETWORK_ID" && -n "$ZT_NETWORK_NAME" && -n "$LICENSE_SERVER_URL" ]]; then
-    configuration_state="configured"
-  fi
 
   say "Unity licensing mode status"
+  say "Version: $VERSION"
   say "Configuration file: $CONFIG_FILE"
-  say "Floating configuration: $configuration_state"
-  say "User config active: $([[ -f "$USER_CONFIG" ]] && echo yes || echo no)"
-  say "System config active: $([[ -f "$SYSTEM_CONFIG" ]] && echo yes || echo no)"
-  say "User config backup: $([[ -f "$USER_DISABLED" ]] && echo "$USER_DISABLED" || echo no)"
-  say "System config backup: $([[ -f "$SYSTEM_DISABLED" ]] && echo "$SYSTEM_DISABLED" || echo no)"
-  say "Floating template: $([[ -f "$FLOATING_TEMPLATE" ]] && echo "$FLOATING_TEMPLATE" || echo no)"
-  say "Personal license: $([[ -f "$PERSONAL_LICENSE" ]] && echo "$PERSONAL_LICENSE" || echo no)"
-  local licensing_client
-  licensing_client="$(licensing_client_pids | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
-  say "Licensing client running: ${licensing_client:-no}"
+  say "Configuration permissions: $CONFIG_PERMISSION_STATE"
+  say "Floating configuration: $(configuration_state)"
+  say "Network provider: $NETWORK_PROVIDER"
+  say "State directory: $MANAGED_DIR"
+  say "User config active: $(file_presence_text "$USER_CONFIG")"
+  say "System config active: $(file_presence_text "$SYSTEM_CONFIG")"
+  say "User config backup: $(file_presence_text "$USER_DISABLED")"
+  say "System config backup: $(file_presence_text "$SYSTEM_DISABLED")"
+  say "Floating template: $(file_presence_text "$FLOATING_TEMPLATE")"
+  say "Personal license: $(file_presence_text "$PERSONAL_LICENSE")"
+  say "Licensing client running: $(licensing_client_running_bool)"
 
-  floating_count="$(find "$LICENSE_DIR" -maxdepth 1 -type f -name '*.xml' ! -name 'UnityEntitlementLicense.xml' 2>/dev/null | wc -l | tr -d ' ')"
-  latest_floating="$(find "$LICENSE_DIR" -maxdepth 1 -type f -name '*.xml' ! -name 'UnityEntitlementLicense.xml' 2>/dev/null | sort | tail -n 1)"
-  say "Floating lease files: ${floating_count:-0}"
-  if [[ -n "$latest_floating" ]]; then
-    say "Latest floating lease: $latest_floating"
+  floating_count="$(license_file_count)"
+  say "Floating lease files: $floating_count"
+  if [[ "$floating_count" -gt 0 ]]; then
+    say "Latest floating lease: present"
   fi
 
   zerotier_status
 }
 
+print_status_json() {
+  local floating_count
+  local zerotier_state
+
+  floating_count="$(license_file_count)"
+  zerotier_state="$(zerotier_membership_state)"
+
+  printf '{\n'
+  printf '  "version": '
+  json_quote "$VERSION"
+  printf ',\n  "configuration_file": '
+  json_quote "$CONFIG_FILE"
+  printf ',\n  "configuration_permissions": '
+  json_quote "$CONFIG_PERMISSION_STATE"
+  printf ',\n  "configuration": '
+  json_quote "$(configuration_state)"
+  printf ',\n  "network_provider": '
+  json_quote "$NETWORK_PROVIDER"
+  printf ',\n  "state_directory": '
+  json_quote "$MANAGED_DIR"
+  printf ',\n  "user_config_active": %s' "$(json_bool_for_file "$USER_CONFIG")"
+  printf ',\n  "system_config_active": %s' "$(json_bool_for_file "$SYSTEM_CONFIG")"
+  printf ',\n  "user_config_backup_present": %s' "$(json_bool_for_file "$USER_DISABLED")"
+  printf ',\n  "system_config_backup_present": %s' "$(json_bool_for_file "$SYSTEM_DISABLED")"
+  printf ',\n  "floating_template_present": %s' "$(json_bool_for_file "$FLOATING_TEMPLATE")"
+  printf ',\n  "personal_license_present": %s' "$(json_bool_for_file "$PERSONAL_LICENSE")"
+  printf ',\n  "licensing_client_running": %s' "$(licensing_client_running_bool)"
+  printf ',\n  "floating_lease_file_count": %s' "$floating_count"
+  printf ',\n  "zerotier": '
+  json_quote "$zerotier_state"
+  printf '\n}\n'
+}
+
+path_access_state() {
+  local path="$1"
+  if [[ -d "$path" && -w "$path" ]]; then
+    printf 'writable'
+  elif [[ -d "$path" ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+      printf 'sudo-required'
+    else
+      printf 'not-writable'
+    fi
+  else
+    printf 'missing'
+  fi
+}
+
+doctor_add_issue() {
+  DOCTOR_ISSUES=$((DOCTOR_ISSUES + 1))
+}
+
+run_doctor_checks() {
+  local template_state
+  local process_tools
+  local system_access
+  local config_state
+  local managed_state
+
+  DOCTOR_ISSUES=0
+  DOCTOR_PLATFORM_SUPPORTED="false"
+  if [[ "$PLATFORM" == "Darwin" ]]; then
+    DOCTOR_PLATFORM_SUPPORTED="true"
+  fi
+  [[ "$DOCTOR_PLATFORM_SUPPORTED" == "true" ]] || doctor_add_issue
+
+  config_state="$(configuration_state)"
+  DOCTOR_CONFIGURATION="$config_state"
+  DOCTOR_CONFIG_PERMISSIONS="$CONFIG_PERMISSION_STATE"
+  if [[ "$config_state" == "missing" || "$config_state" == "insecure" || "$config_state" == "unknown" || "$config_state" == "incomplete" ]]; then
+    doctor_add_issue
+  fi
+  if [[ "$config_state" == "invalid" ]]; then
+    doctor_add_issue
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    DOCTOR_JQ="available"
+  else
+    DOCTOR_JQ="missing"
+    doctor_add_issue
+  fi
+
+  if command -v osascript >/dev/null 2>&1 && command -v pgrep >/dev/null 2>&1; then
+    process_tools="available"
+  else
+    process_tools="incomplete"
+    doctor_add_issue
+  fi
+  DOCTOR_PROCESS_TOOLS="$process_tools"
+  if [[ "$process_tools" == "available" ]] && unity_running; then
+    DOCTOR_UNITY_PROCESS="running"
+  else
+    DOCTOR_UNITY_PROCESS="not-running"
+  fi
+  DOCTOR_LICENSE_CLIENT="$(licensing_client_running_bool)"
+
+  if [[ -n "$LICENSE_SERVER_URL" && "$DOCTOR_JQ" == "available" ]]; then
+    if [[ -f "$FLOATING_TEMPLATE" ]]; then
+      if validate_floating_config_file "$FLOATING_TEMPLATE"; then
+        template_state="valid"
+      else
+        template_state="invalid"
+        doctor_add_issue
+      fi
+    else
+      template_state="missing"
+    fi
+  elif [[ -z "$LICENSE_SERVER_URL" ]]; then
+    template_state="not-configured"
+  else
+    template_state="unavailable"
+  fi
+  DOCTOR_TEMPLATE="$template_state"
+
+  DOCTOR_SERVER="$(server_reachability_state)"
+  if [[ "$DOCTOR_SERVER" == "unreachable" ]]; then
+    doctor_add_issue
+  fi
+
+  validate_network_settings >/dev/null 2>&1 || {
+    DOCTOR_PROVIDER="invalid"
+    doctor_add_issue
+  }
+  if [[ "${DOCTOR_PROVIDER:-}" != "invalid" ]]; then
+    case "$NETWORK_PROVIDER" in
+      direct)
+        DOCTOR_PROVIDER="direct (existing operating-system route)"
+        ;;
+      zerotier)
+        DOCTOR_PROVIDER="$(zerotier_membership_state)"
+        case "$DOCTOR_PROVIDER" in
+          joined)
+            managed_state="$(zerotier_managed_state)"
+            DOCTOR_PROVIDER="$DOCTOR_PROVIDER (managed routes: $managed_state)"
+            [[ "$managed_state" == "enabled" ]] || doctor_add_issue
+            ;;
+          *)
+            doctor_add_issue
+            ;;
+        esac
+        ;;
+      *)
+        DOCTOR_PROVIDER="invalid"
+        doctor_add_issue
+        ;;
+    esac
+  fi
+
+  system_access="$(path_access_state "$SYSTEM_CONFIG_DIR")"
+  DOCTOR_SYSTEM_ACCESS="$system_access"
+  if [[ "$system_access" == "not-writable" ]]; then
+    doctor_add_issue
+  fi
+
+  DOCTOR_LOCK="$(if [[ -e "$LOCK_DIR" ]]; then printf 'held'; else printf 'available'; fi)"
+  DOCTOR_OK="false"
+  if [[ "$DOCTOR_ISSUES" -eq 0 ]]; then
+    DOCTOR_OK="true"
+  fi
+}
+
+print_doctor_text() {
+  run_doctor_checks
+  say "Unity licensing mode doctor"
+  say "Version: $VERSION"
+  say "Platform: $PLATFORM (mode changes supported on macOS: $DOCTOR_PLATFORM_SUPPORTED)"
+  say "Configuration file: $CONFIG_FILE"
+  say "Configuration permissions: $DOCTOR_CONFIG_PERMISSIONS"
+  say "Configuration: $DOCTOR_CONFIGURATION"
+  say "jq JSON validator: $DOCTOR_JQ"
+  say "Unity process tools: $DOCTOR_PROCESS_TOOLS"
+  say "Unity Hub/Editor: $DOCTOR_UNITY_PROCESS"
+  say "Unity Licensing Client: $DOCTOR_LICENSE_CLIENT"
+  say "System config access: $DOCTOR_SYSTEM_ACCESS"
+  say "Floating template: $DOCTOR_TEMPLATE"
+  say "Network provider: $DOCTOR_PROVIDER"
+  say "Licensing server reachability: $DOCTOR_SERVER"
+  say "Transaction lock: $DOCTOR_LOCK"
+  if [[ "$DOCTOR_OK" == "true" ]]; then
+    say "Doctor result: pass"
+  else
+    say "Doctor result: $DOCTOR_ISSUES issue(s) need attention"
+  fi
+}
+
+print_doctor_json() {
+  run_doctor_checks
+  printf '{\n'
+  printf '  "version": '
+  json_quote "$VERSION"
+  printf ',\n  "platform": '
+  json_quote "$PLATFORM"
+  printf ',\n  "platform_supported": %s' "$DOCTOR_PLATFORM_SUPPORTED"
+  printf ',\n  "configuration_file": '
+  json_quote "$CONFIG_FILE"
+  printf ',\n  "configuration_permissions": '
+  json_quote "$DOCTOR_CONFIG_PERMISSIONS"
+  printf ',\n  "configuration": '
+  json_quote "$DOCTOR_CONFIGURATION"
+  printf ',\n  "jq": '
+  json_quote "$DOCTOR_JQ"
+  printf ',\n  "process_tools": '
+  json_quote "$DOCTOR_PROCESS_TOOLS"
+  printf ',\n  "unity_process": '
+  json_quote "$DOCTOR_UNITY_PROCESS"
+  printf ',\n  "licensing_client_running": %s' "$DOCTOR_LICENSE_CLIENT"
+  printf ',\n  "system_config_access": '
+  json_quote "$DOCTOR_SYSTEM_ACCESS"
+  printf ',\n  "floating_template": '
+  json_quote "$DOCTOR_TEMPLATE"
+  printf ',\n  "network_provider": '
+  json_quote "$DOCTOR_PROVIDER"
+  printf ',\n  "server_reachability": '
+  json_quote "$DOCTOR_SERVER"
+  printf ',\n  "transaction_lock": '
+  json_quote "$DOCTOR_LOCK"
+  printf ',\n  "issues": %s,\n  "ok": %s\n}\n' "$DOCTOR_ISSUES" "$DOCTOR_OK"
+}
+
+transaction_path_for_label() {
+  case "$1" in
+    user_config) printf '%s' "$USER_CONFIG" ;;
+    system_config) printf '%s' "$SYSTEM_CONFIG" ;;
+    user_backup) printf '%s' "$USER_DISABLED" ;;
+    system_backup) printf '%s' "$SYSTEM_DISABLED" ;;
+    floating_template) printf '%s' "$FLOATING_TEMPLATE" ;;
+    *) die "Unknown transaction snapshot label." ;;
+  esac
+}
+
+write_transaction_metadata() {
+  local status="$1"
+  {
+    printf 'version=%s\n' "$VERSION"
+    printf 'command=%s\n' "${ACTIVE_COMMAND:-unknown}"
+    printf 'pid=%s\n' "$$"
+    printf 'status=%s\n' "$status"
+    printf 'started_at=%s\n' "${TRANSACTION_STARTED_AT:-unknown}"
+    printf 'updated_at=%s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    printf 'configuration_file=%s\n' "$CONFIG_FILE"
+  } > "$TRANSACTION_DIR/metadata"
+  chmod 600 "$TRANSACTION_DIR/metadata" 2>/dev/null || true
+}
+
+capture_snapshot_path() {
+  local label="$1"
+  local path
+  local state_file
+  local data_file
+
+  path="$(transaction_path_for_label "$label")"
+  state_file="$TRANSACTION_DIR/snapshot/$label.state"
+  data_file="$TRANSACTION_DIR/snapshot/$label.data"
+  if [[ -f "$path" ]]; then
+    printf 'exists\n' > "$state_file"
+    copy_file "$path" "$data_file"
+  else
+    printf 'absent\n' > "$state_file"
+  fi
+}
+
+begin_transaction() {
+  local command="$1"
+  local label
+
+  ensure_dir "$MANAGED_DIR/transactions"
+  TRANSACTION_DIR="$MANAGED_DIR/transactions/$(timestamp)-$$-${RANDOM}-${command}"
+  mkdir -p "$TRANSACTION_DIR/snapshot"
+  chmod 700 "$TRANSACTION_DIR" "$TRANSACTION_DIR/snapshot" 2>/dev/null || true
+  ACTIVE_COMMAND="$command"
+  TRANSACTION_STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  TRANSACTION_ACTIVE=1
+  write_transaction_metadata started
+
+  for label in user_config system_config user_backup system_backup floating_template; do
+    capture_snapshot_path "$label"
+  done
+}
+
+restore_snapshot_path() {
+  local label="$1"
+  local path
+  local state_file
+  local data_file
+  local state
+
+  path="$(transaction_path_for_label "$label")"
+  state_file="$TRANSACTION_DIR/snapshot/$label.state"
+  data_file="$TRANSACTION_DIR/snapshot/$label.data"
+  [[ -f "$state_file" ]] || return 0
+  state="$(<"$state_file")"
+  if [[ "$state" == "exists" ]]; then
+    [[ -f "$data_file" ]] || return 1
+    ensure_dir "$(dirname "$path")"
+    copy_file "$data_file" "$path"
+  else
+    remove_file "$path"
+  fi
+}
+
+rollback_transaction() {
+  local original_status="$1"
+  local label
+  local rollback_failed=0
+
+  set +e
+  for label in user_config system_config user_backup system_backup floating_template; do
+    if ! restore_snapshot_path "$label"; then
+      rollback_failed=1
+    fi
+  done
+  if [[ "$rollback_failed" -eq 0 ]]; then
+    write_transaction_metadata rolled_back
+    say "Mode change failed; original Unity configuration was restored."
+  else
+    write_transaction_metadata rollback_failed
+    warn "Mode change failed and automatic rollback was incomplete; inspect transaction metadata at $TRANSACTION_DIR."
+  fi
+  TRANSACTION_ACTIVE=0
+  set -e
+  return "$original_status"
+}
+
+commit_transaction() {
+  write_transaction_metadata committed
+  TRANSACTION_ACTIVE=0
+}
+
+release_lock() {
+  [[ "$LOCK_ACQUIRED" == "1" ]] || return 0
+  rm -f "$LOCK_DIR/metadata" 2>/dev/null || true
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+  LOCK_ACQUIRED=0
+}
+
+acquire_lock() {
+  local command="$1"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    [[ ! -e "$LOCK_DIR" ]] || die "Another unity-licensing-mode operation already holds the lock."
+    say "Dry run: operation lock is available; no lock was created."
+    return
+  fi
+
+  ensure_dir "$MANAGED_DIR"
+  ensure_dir "$(dirname "$LOCK_DIR")"
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    die "Another unity-licensing-mode operation already holds the lock."
+  fi
+  LOCK_ACQUIRED=1
+  {
+    printf 'pid=%s\n' "$$"
+    printf 'command=%s\n' "$command"
+    printf 'started_at=%s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  } > "$LOCK_DIR/metadata"
+  chmod 600 "$LOCK_DIR/metadata" 2>/dev/null || true
+}
+
+transaction_exit() {
+  local status=$?
+  trap - EXIT
+  if [[ "$TRANSACTION_ACTIVE" == "1" ]]; then
+    if [[ "$status" -eq 0 ]]; then
+      set +e
+      commit_transaction
+      set -e
+    else
+      rollback_transaction "$status" || true
+    fi
+  fi
+  release_lock
+  exit "$status"
+}
+
+require_supported_mode_platform() {
+  [[ "$PLATFORM" == "Darwin" ]] || die "Mode-changing commands currently support macOS only; use doctor to inspect this platform."
+}
+
+run_mode_change() {
+  local command="$1"
+  local action="$2"
+
+  if [[ "$OUTPUT_FORMAT" != "text" ]]; then
+    die "--json is supported only by status and doctor."
+  fi
+  if [[ "$DRY_RUN" == "1" ]]; then
+    say "Dry run enabled: no files, processes, network settings, or lease commands will be changed."
+    acquire_lock "$command"
+    "$action"
+    return
+  fi
+
+  require_supported_mode_platform
+  acquire_lock "$command"
+  begin_transaction "$command"
+  "$action"
+  commit_transaction
+}
+
 activate_floating_mode() {
   require_floating_configuration
+  require_json_validator
+  seed_template_if_missing required
+  ensure_network_provider
   quit_unity
   stop_licensing_client
-  seed_template_if_missing required
-  ensure_zerotier_managed_routes
 
   disable_config "$USER_CONFIG" "$USER_DISABLED"
   disable_config "$SYSTEM_CONFIG" "$SYSTEM_DISABLED"
@@ -341,92 +1210,211 @@ activate_floating_mode() {
   verify_floating_config
 
   say "Floating licensing mode is active."
-  say "Unity licensing client will reload this mode when Unity Hub or the Editor starts."
+  say "The Unity Licensing Client will reload this mode when Unity Hub or the Editor starts."
 }
 
 activate_personal_mode() {
+  seed_template_if_missing optional
   quit_unity
   stop_licensing_client
-  seed_template_if_missing optional
 
   disable_config "$USER_CONFIG" "$USER_DISABLED"
   disable_config "$SYSTEM_CONFIG" "$SYSTEM_DISABLED"
 
   say "Personal mode is active."
-  say "Next: sign into your private Unity account and open Unity normally."
+  say "Next: sign into your authorized Unity account and open Unity normally."
+}
+
+read_return_token() {
+  local provided="${1:-}"
+  local token=""
+
+  if [[ -n "$provided" ]]; then
+    warn "A positional return token is deprecated; provide it through stdin or the interactive prompt instead."
+    printf '%s' "$provided"
+    return
+  fi
+
+  if [[ -t 0 ]]; then
+    IFS= read -r -s -p "Floating lease return token: " token || die "Could not read the floating lease return token."
+    printf '\n' >&2
+  else
+    IFS= read -r token || true
+  fi
+  [[ -n "$token" ]] || die "No floating lease return token was provided."
+  printf '%s' "$token"
 }
 
 return_floating() {
-  local token="${1:-}"
-  [[ -n "$token" ]] || die "Usage: $SCRIPT_NAME return-floating <token>"
-  [[ -x "$UNITY_LICENSE_CLI" ]] || die "unity-license CLI not found at $UNITY_LICENSE_CLI"
+  local provided="${1:-}"
+  local token
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    say "Dry run: would return a floating lease using the configured Unity license CLI."
+    return
+  fi
+
+  [[ -x "$UNITY_LICENSE_CLI" ]] || die "Unity license CLI is not executable at the configured path."
+  case "$UNITY_LICENSE_CLI_MODE" in
+    stdin|argument)
+      ;;
+    *)
+      die "UNITY_LICENSE_CLI_MODE must be stdin or argument."
+      ;;
+  esac
+  token="$(read_return_token "$provided")"
 
   quit_unity
   stop_licensing_client
-  "$UNITY_LICENSE_CLI" --return-floating "$token"
-}
-
-usage() {
-  cat <<EOF
-Usage: $SCRIPT_NAME <command>
-
-Commands:
-  status
-      Show current Unity mode inputs: active configs, backups, licenses, and ZeroTier state.
-
-  personal
-      Disable floating licensing cleanly by backing up any active Unity services-config.json files.
-      This keeps your local personal license path active and preserves a floating template for later.
-
-  floating
-      Enable floating licensing by restoring the preserved floating template to:
-      /Library/Application Support/Unity/config/services-config.json
-      This also disables the user-level Unity services-config.json to avoid duplicate config sources.
-
-  reload-client
-      Stop the running Unity licensing client so it reloads the selected mode on next Unity start.
-
-  return-floating <token>
-      Close Unity and return a floating lease using the unity-license CLI.
-
-Notes:
-  - This script never deletes Unity config files. It only copies or moves them into backups.
-  - Commands that touch /Library will prompt for sudo.
-  - Copy config/example.conf to config/local.conf and fill in your private values.
-  - The local config and runtime state are ignored by Git.
-  - The preserved floating template lives at:
-      $FLOATING_TEMPLATE
-EOF
-}
-
-main() {
-  local command="${1:-status}"
-  shift || true
-
-  case "$command" in
-    status)
-      print_status
+  case "$UNITY_LICENSE_CLI_MODE" in
+    stdin)
+      printf '%s\n' "$token" | "$UNITY_LICENSE_CLI" --return-floating
       ;;
-    personal)
-      activate_personal_mode
-      ;;
-    floating)
-      activate_floating_mode
-      ;;
-    reload-client)
-      stop_licensing_client
-      ;;
-    return-floating)
-      return_floating "${1:-}"
-      ;;
-    help|-h|--help)
-      usage
+    argument)
+      warn "UNITY_LICENSE_CLI_MODE=argument exposes the token to process inspection; use stdin mode when supported."
+      "$UNITY_LICENSE_CLI" --return-floating "$token"
       ;;
     *)
-      usage
-      exit 1
+      die "UNITY_LICENSE_CLI_MODE must be stdin or argument."
       ;;
   esac
 }
 
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME [--dry-run] [--json] <command>
+
+Commands:
+  status
+      Show a redacted report of the current Unity licensing inputs and state.
+
+  doctor
+      Run a read-only preflight for platform paths, permissions, processes,
+      JSON validation, network state, and licensing-server reachability.
+
+  version
+      Print the maintained version from VERSION.
+
+  personal
+      Disable floating licensing cleanly by backing up active Unity configs.
+
+  floating
+      Validate and install the preserved floating Unity config.
+
+  reload-client
+      Stop the running Unity Licensing Client so it reloads the selected mode.
+
+  return-floating [token]
+      Return a floating lease. Prefer stdin or the interactive prompt; a
+      positional token is retained only as a deprecated compatibility path.
+
+Options:
+  --dry-run
+      Preview every mode-changing operation without changing files, processes,
+      network settings, or leases.
+  --json
+      Emit machine-readable, redacted output for status or doctor.
+  --version
+      Print the maintained version.
+  --help
+      Show this help.
+
+Notes:
+  - Mode-changing commands use a lock and transaction metadata under the state directory.
+  - Failed configuration changes restore the captured Unity configuration state.
+  - Floating config JSON is validated with jq and must match the configured endpoint.
+  - The direct network provider uses the existing operating-system route.
+  - ZeroTier route changes require UNITY_NETWORK_ALLOW_CHANGES=true.
+EOF
+}
+
+main() {
+  local command
+  local argument_count
+  POSITIONAL_ARGS=()
+
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --dry-run)
+        DRY_RUN=1
+        ;;
+      --json)
+        OUTPUT_FORMAT="json"
+        ;;
+      --version|-V)
+        printf 'unity-licensing-mode %s\n' "$VERSION"
+        return 0
+        ;;
+      --help|-h)
+        usage
+        return 0
+        ;;
+      --*)
+        die "Unknown option: $1"
+        ;;
+      *)
+        POSITIONAL_ARGS+=("$1")
+        ;;
+    esac
+    shift
+  done
+
+  command="${POSITIONAL_ARGS[0]:-status}"
+  argument_count="${#POSITIONAL_ARGS[@]}"
+
+  case "$command" in
+    help)
+      [[ "$argument_count" -eq 1 ]] || die "Usage: $SCRIPT_NAME help"
+      usage
+      ;;
+    version)
+      [[ "$argument_count" -eq 1 ]] || die "Usage: $SCRIPT_NAME version"
+      printf 'unity-licensing-mode %s\n' "$VERSION"
+      ;;
+    status)
+      [[ "$argument_count" -eq 1 ]] || die "Usage: $SCRIPT_NAME [--json] status"
+      load_configuration 0
+      if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+        print_status_json
+      else
+        print_status_text
+      fi
+      ;;
+    doctor)
+      [[ "$argument_count" -eq 1 ]] || die "Usage: $SCRIPT_NAME [--json] doctor"
+      load_configuration 0
+      if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+        print_doctor_json
+      else
+        print_doctor_text
+      fi
+      ;;
+    personal|floating|reload-client)
+      [[ "$argument_count" -eq 1 ]] || die "Usage: $SCRIPT_NAME [--dry-run] $command"
+      load_configuration 1
+      case "$command" in
+        personal)
+          run_mode_change personal activate_personal_mode
+          ;;
+        floating)
+          run_mode_change floating activate_floating_mode
+          ;;
+        reload-client)
+          run_mode_change reload-client stop_licensing_client
+          ;;
+      esac
+      ;;
+    return-floating)
+      [[ "$argument_count" -le 2 ]] || die "Usage: $SCRIPT_NAME [--dry-run] return-floating [token]"
+      load_configuration 1
+      run_mode_change return-floating return_floating
+      ;;
+    *)
+      usage
+      return 1
+      ;;
+  esac
+}
+
+trap 'transaction_exit' EXIT
 main "$@"
