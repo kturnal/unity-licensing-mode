@@ -53,9 +53,15 @@ jobs:
       - name: Scan tracked source for high-confidence credential markers
         shell: bash
         run: |
-          if git grep -n -E '-----BEGIN (RSA|OPENSSH|EC) PRIVATE KEY-----|sk-[A-Za-z0-9]{20,}' -- .; then
-            echo 'credential marker found in tracked source' >&2
+          if matches="$(git grep -I -l -E -e '-----BEGIN (RSA|OPENSSH|EC) PRIVATE KEY-----|sk-[A-Za-z0-9]{20,}' -- .)"; then
+            printf 'credential marker found in tracked source:\n%s\n' "$matches" >&2
             exit 1
+          else
+            status=$?
+            if [[ "$status" -ne 1 ]]; then
+              printf 'credential scan failed with status %s\n' "$status" >&2
+              exit "$status"
+            fi
           fi
 
       # The behavioral fixtures drive the tool through real chmod/stat and

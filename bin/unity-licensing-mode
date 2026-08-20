@@ -199,7 +199,7 @@ ZT_NETWORK_NAME=""
 LICENSE_SERVER_URL=""
 NETWORK_ALLOW_CHANGES=""
 UNITY_LICENSE_CLI=""
-UNITY_LICENSE_CLI_MODE=""
+LICENSE_CLI_MODE=""
 
 TRANSACTION_DIR=""
 TRANSACTION_ACTIVE=0
@@ -319,7 +319,7 @@ load_configuration() {
   UNITY_LICENSE_CLI="${UNITY_LICENSE_CLI:-${configured_value:-/usr/local/bin/unity-license}}"
 
   configured_value="$(read_config_value UNITY_LICENSE_CLI_MODE)"
-  UNITY_LICENSE_CLI_MODE="${UNITY_LICENSE_CLI_MODE:-${configured_value:-stdin}}"
+  LICENSE_CLI_MODE="${UNITY_LICENSE_CLI_MODE:-${configured_value:-argument}}"
 }
 
 path_needs_root() {
@@ -560,11 +560,23 @@ seed_template_if_missing() {
   local required="${1:-required}"
   local candidate
 
+  if [[ -n "$LICENSE_SERVER_URL" ]] && ! command -v jq >/dev/null 2>&1; then
+    if [[ "$required" == "required" ]]; then
+      die "jq is required to validate Unity floating configuration JSON."
+    fi
+    warn "jq is unavailable; continuing without preserving a validated floating template."
+    return
+  fi
+
   if [[ -f "$FLOATING_TEMPLATE" ]]; then
     if [[ -n "$LICENSE_SERVER_URL" ]] && ! validate_floating_config_file "$FLOATING_TEMPLATE"; then
-      die "The preserved floating template is not valid JSON for the configured licensing server."
+      if [[ "$required" == "required" ]]; then
+        die "The preserved floating template is not valid JSON for the configured licensing server."
+      fi
+      warn "The preserved floating template does not match the configured licensing server; searching for a valid replacement."
+    else
+      return
     fi
-    return
   fi
 
   if [[ -z "$LICENSE_SERVER_URL" ]]; then
@@ -1083,7 +1095,7 @@ run_doctor_checks() {
     doctor_add_issue
   fi
 
-  validate_network_settings >/dev/null 2>&1 || {
+  (validate_network_settings >/dev/null 2>&1) || {
     DOCTOR_PROVIDER="invalid"
     doctor_add_issue
   }
@@ -1118,7 +1130,12 @@ run_doctor_checks() {
     doctor_add_issue
   fi
 
-  DOCTOR_LOCK="$(if [[ -e "$LOCK_DIR" ]]; then printf 'held'; else printf 'available'; fi)"
+  if [[ -e "$LOCK_DIR" ]]; then
+    DOCTOR_LOCK="held"
+    doctor_add_issue
+  else
+    DOCTOR_LOCK="available"
+  fi
   DOCTOR_OK="false"
   if [[ "$DOCTOR_ISSUES" -eq 0 ]]; then
     DOCTOR_OK="true"
@@ -1363,6 +1380,8 @@ require_supported_mode_platform() {
 run_mode_change() {
   local command="$1"
   local action="$2"
+  local transaction_scope="$3"
+  shift 3
 
   if [[ "$OUTPUT_FORMAT" != "text" ]]; then
     die "--json is supported only by status and doctor."
@@ -1370,15 +1389,19 @@ run_mode_change() {
   if [[ "$DRY_RUN" == "1" ]]; then
     say "Dry run enabled: no files, processes, network settings, or lease commands will be changed."
     acquire_lock "$command"
-    "$action"
+    "$action" "$@"
     return
   fi
 
   require_supported_mode_platform
   acquire_lock "$command"
-  begin_transaction "$command"
-  "$action"
-  commit_transaction
+  if [[ "$transaction_scope" == "configuration" ]]; then
+    begin_transaction "$command"
+  fi
+  "$action" "$@"
+  if [[ "$TRANSACTION_ACTIVE" == "1" ]]; then
+    commit_transaction
+  fi
 }
 
 activate_floating_mode() {
@@ -1442,7 +1465,7 @@ return_floating() {
   fi
 
   [[ -x "$UNITY_LICENSE_CLI" ]] || die "Unity license CLI is not executable at the configured path."
-  case "$UNITY_LICENSE_CLI_MODE" in
+  case "$LICENSE_CLI_MODE" in
     stdin|argument)
       ;;
     *)
@@ -1453,7 +1476,7 @@ return_floating() {
 
   quit_unity
   stop_licensing_client
-  case "$UNITY_LICENSE_CLI_MODE" in
+  case "$LICENSE_CLI_MODE" in
     stdin)
       printf '%s\n' "$token" | "$UNITY_LICENSE_CLI" --return-floating
       ;;
@@ -1509,7 +1532,8 @@ Options:
       Show this help.
 
 Notes:
-  - Mode-changing commands use a lock and transaction metadata under the state directory.
+  - Mode-changing commands use a lock under the state directory.
+  - Configuration changes also use transaction metadata and captured snapshots.
   - Failed configuration changes restore the captured Unity configuration state.
   - Floating config JSON is validated with jq and must match the configured endpoint.
   - The direct network provider uses the existing operating-system route.
@@ -1587,20 +1611,20 @@ main() {
       load_configuration 1
       case "$command" in
         personal)
-          run_mode_change personal activate_personal_mode
+          run_mode_change personal activate_personal_mode configuration
           ;;
         floating)
-          run_mode_change floating activate_floating_mode
+          run_mode_change floating activate_floating_mode configuration
           ;;
         reload-client)
-          run_mode_change reload-client stop_licensing_client
+          run_mode_change reload-client stop_licensing_client none
           ;;
       esac
       ;;
     return-floating)
       [[ "$argument_count" -le 2 ]] || die "Usage: $SCRIPT_NAME [--dry-run] return-floating [token]"
       load_configuration 1
-      run_mode_change return-floating return_floating
+      run_mode_change return-floating return_floating none "${POSITIONAL_ARGS[1]:-}"
       ;;
     *)
       usage

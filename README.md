@@ -81,7 +81,7 @@ protect it with mode 600.
 | UNITY_NETWORK_ALLOW_CHANGES | floating with ZeroTier | Opts in to joining the configured ZeroTier network and enabling its managed routes. | false |
 | UNITY_LICENSE_SERVER_URL | floating | Expected http:// or https:// endpoint. | None |
 | UNITY_LICENSE_CLI | return-floating | Path to the local Unity license CLI. | /usr/local/bin/unity-license |
-| UNITY_LICENSE_CLI_MODE | return-floating | stdin keeps the token out of process arguments; argument is a compatibility fallback. | stdin |
+| UNITY_LICENSE_CLI_MODE | return-floating | argument supports Unity.Licensing.Client; stdin is for a compatible custom wrapper. | argument |
 
 The legacy aliases UNITY_ZEROTIER_NETWORK_ID and
 UNITY_ZEROTIER_NETWORK_NAME remain supported. Environment variables override
@@ -146,25 +146,25 @@ printf '%s\n' 'token-from-a-secure-secret-store' \
 
 With no stdin data, the command prompts without echoing the token. The
 positional form return-floating TOKEN remains a deprecated compatibility path
-and can expose the token to shell history or process inspection. In stdin
-mode, the configured Unity license CLI must read the token from stdin. Set
-UNITY_LICENSE_CLI_MODE=argument only when the CLI requires its historical
-argument form.
+and can expose the token to shell history. By default, the helper passes the
+captured token as the argument required by Unity.Licensing.Client, which may
+briefly expose it to process inspection. Set UNITY_LICENSE_CLI_MODE=stdin only
+when the configured CLI is a custom wrapper that reads the token from stdin.
 
 ## Safety model
 
 Mode-changing commands use an atomic directory lock under the state directory.
-Each operation records metadata under:
+The personal and floating configuration changes also record metadata under:
 
 ~~~
 <state-directory>/transactions/<timestamp>-<pid>-<random>-<command>/
 ~~~
 
-The metadata contains the version, command, timestamps, configuration-file
-path, and final status. Before changing Unity configuration, the command
-captures the active and managed files it can affect. If a later step fails, it
-restores those snapshots and records rolled_back; an incomplete rollback is
-recorded as rollback_failed for inspection.
+Transaction metadata contains the version, command, timestamps,
+configuration-file path, and final status. Before changing Unity
+configuration, the command captures the active and managed files it can affect.
+If a later step fails, it restores those snapshots and records rolled_back; an
+incomplete rollback is recorded as rollback_failed for inspection.
 
 Repeating a successful mode change is safe: existing files are backed up
 without deletion, the selected configuration is reinstalled, and the lock is
