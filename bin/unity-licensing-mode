@@ -249,10 +249,11 @@ config_file_mode() {
     return
   }
 
-  mode="$(stat -f '%Lp' "$CONFIG_FILE" 2>/dev/null || true)"
-  if [[ -z "$mode" ]]; then
-    mode="$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null || true)"
-  fi
+  # GNU coreutils uses "stat -c %a"; BSD/macOS uses "stat -f %Lp". Try the GNU
+  # form first: BSD stat rejects -c cleanly, whereas GNU "stat -f <file>" prints
+  # unrelated filesystem details instead of failing, which would defeat a
+  # "-z $mode" fallback check.
+  mode="$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null || stat -f '%Lp' "$CONFIG_FILE" 2>/dev/null || true)"
 
   if [[ "$mode" =~ ^0?[0-7]{3,4}$ ]]; then
     while [[ "${#mode}" -gt 3 ]]; do

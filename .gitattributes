@@ -1,0 +1,4 @@
+# This project is shell-first; keep every text file LF on all platforms so the
+# Windows CI runner (git autocrlf=true) does not check scripts out with CRLF,
+# which ShellCheck rejects as SC1017.
+* text=auto eol=lf
