@@ -77,7 +77,7 @@ protect it with mode 600.
 | UNITY_NETWORK_PROVIDER | floating | direct for an existing route or zerotier for ZeroTier. | zerotier |
 | UNITY_NETWORK_ID | floating with ZeroTier | ZeroTier network ID. | None |
 | UNITY_NETWORK_NAME | floating with ZeroTier | Human-readable local label. | None |
-| UNITY_NETWORK_ALLOW_CHANGES | floating with ZeroTier | Opts in to enabling managed ZeroTier routes. | false |
+| UNITY_NETWORK_ALLOW_CHANGES | floating with ZeroTier | Opts in to joining the configured ZeroTier network and enabling its managed routes. | false |
 | UNITY_LICENSE_SERVER_URL | floating | Expected http:// or https:// endpoint. | None |
 | UNITY_LICENSE_CLI | return-floating | Path to the local Unity license CLI. | /usr/local/bin/unity-license |
 | UNITY_LICENSE_CLI_MODE | return-floating | stdin keeps the token out of process arguments; argument is a compatibility fallback. | stdin |
@@ -129,6 +129,12 @@ CLI:
 ./bin/unity-licensing-mode --dry-run return-floating
 ~~~
 
+Output is colored when stderr is a terminal. Disable it with --no-color, the
+NO_COLOR environment variable, or by redirecting output. When
+UNITY_NETWORK_ALLOW_CHANGES is off, status, doctor, and floating highlight that
+the ZeroTier network will not be joined or configured and print the exact line
+to add or the command to prefix.
+
 For a secure floating-lease return:
 
 ~~~
@@ -168,8 +174,13 @@ licensingServiceBaseUrl exactly matches UNITY_LICENSE_SERVER_URL. A malformed,
 personal, or wrong-endpoint file is not selected.
 
 ZeroTier route changes are opt-in through
-UNITY_NETWORK_ALLOW_CHANGES=true. The command never automatically joins or
-authorizes a network.
+UNITY_NETWORK_ALLOW_CHANGES=true. With that set, floating joins the configured
+network (sudo zerotier-cli join) when the node is not already a member and
+enables its managed routes. It waits up to ten seconds for the membership to
+register and warns if the network status is not yet OK. Authorization on the
+network controller is never performed automatically; a joined-but-unauthorized
+node still needs to be approved there. With the flag left at false the command
+neither joins nor changes any network.
 
 ## How switching works
 

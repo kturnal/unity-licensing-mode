@@ -26,16 +26,58 @@ if [[ -z "$USER_HOME" ]]; then
   exit 1
 fi
 
+if [[ -z "${NO_COLOR:-}" && -z "${UNITY_LICENSING_MODE_NO_COLOR:-}" ]] && [[ -t 2 ]]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'
+  C_YELLOW=$'\033[33m'
+  C_GREEN=$'\033[32m'
+  C_CYAN=$'\033[36m'
+else
+  C_RESET=""
+  C_BOLD=""
+  C_DIM=""
+  C_RED=""
+  C_YELLOW=""
+  C_GREEN=""
+  C_CYAN=""
+fi
+
+disable_color() {
+  C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_YELLOW=""; C_GREEN=""; C_CYAN=""
+}
+
 say() {
   printf '%s\n' "$*"
 }
 
 warn() {
-  printf 'warning: %s\n' "$*" >&2
+  printf '%swarning:%s %s\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$*" >&2
 }
 
 die() {
-  printf 'error: %s\n' "$*" >&2
+  printf '%serror:%s %s\n' "$C_RED$C_BOLD" "$C_RESET" "$*" >&2
+  exit 1
+}
+
+# die_action <summary> <step> [<step> ...]
+# Prints a red one-line summary followed by a highlighted, numbered list of
+# concrete things the user can do to move forward, then exits non-zero.
+die_action() {
+  local summary="$1"
+  shift
+  printf '\n%serror:%s %s%s%s\n' "$C_RED$C_BOLD" "$C_RESET" "$C_RED" "$summary" "$C_RESET" >&2
+  if [[ "$#" -gt 0 ]]; then
+    printf '\n%sTo continue, do one of the following:%s\n' "$C_YELLOW$C_BOLD" "$C_RESET" >&2
+    local index=1
+    local step
+    for step in "$@"; do
+      printf '  %s%d.%s %s\n' "$C_YELLOW$C_BOLD" "$index" "$C_RESET" "$step" >&2
+      index=$((index + 1))
+    done
+  fi
+  printf '\n' >&2
   exit 1
 }
 
@@ -645,6 +687,47 @@ zerotier_joined() {
   [[ -n "$status_line" ]]
 }
 
+zerotier_node_id() {
+  zerotier_cli_available || return 1
+  zerotier-cli info 2>/dev/null | awk '{print $3}'
+}
+
+zerotier_network_status() {
+  zerotier_cli_available || return 1
+  [[ -n "$ZT_NETWORK_ID" ]] || return 1
+  zerotier-cli listnetworks 2>/dev/null | awk -v nwid="$ZT_NETWORK_ID" '$3 == nwid {print $6}'
+}
+
+zerotier_join_network() {
+  local attempt=0
+  local status
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    say "Would join ZeroTier network $ZT_NETWORK_ID ($ZT_NETWORK_NAME)."
+    return 0
+  fi
+
+  say "Joining ZeroTier network $ZT_NETWORK_ID ($ZT_NETWORK_NAME)."
+  sudo zerotier-cli join "$ZT_NETWORK_ID" >/dev/null \
+    || die "Failed to join ZeroTier network $ZT_NETWORK_ID."
+
+  while (( attempt < 10 )); do
+    if zerotier_joined; then
+      status="$(zerotier_network_status)"
+      if [[ "$status" == "OK" ]]; then
+        say "ZeroTier network $ZT_NETWORK_ID is joined and authorized."
+      else
+        warn "ZeroTier network $ZT_NETWORK_ID joined but not yet authorized (status: ${status:-unknown}); authorize node $(zerotier_node_id) on the network controller."
+      fi
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+  done
+
+  die "ZeroTier join for $ZT_NETWORK_ID did not register after 10 seconds."
+}
+
 zerotier_managed_state() {
   local managed
   if ! zerotier_joined; then
@@ -694,15 +777,57 @@ zerotier_status() {
       ;;
     not-joined)
       say "ZeroTier: configured network is not joined"
+      network_changes_hint
       ;;
     joined)
       managed="$(zerotier_managed_state)"
       say "ZeroTier: joined (managed routes: $managed)"
+      if [[ "$managed" != "enabled" ]]; then
+        network_changes_hint
+      fi
       ;;
     *)
       say "ZeroTier: unavailable"
       ;;
   esac
+}
+
+# One-line, colored reminder that UNITY_NETWORK_ALLOW_CHANGES must be enabled for
+# "floating" to manage the ZeroTier network. Prints nothing when it is already
+# enabled or when the ZeroTier provider is not in use.
+network_changes_hint() {
+  if [[ "$NETWORK_PROVIDER" != "zerotier" ]]; then
+    return 0
+  fi
+  if [[ "$NETWORK_ALLOW_CHANGES" == "true" ]]; then
+    return 0
+  fi
+  printf '%s!%s %sUNITY_NETWORK_ALLOW_CHANGES%s is not enabled, so "floating" will not join or configure this ZeroTier network.\n' \
+    "$C_YELLOW$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+  printf '  %sTo enable it:%s add %sUNITY_NETWORK_ALLOW_CHANGES="true"%s to %s%s%s, or prefix one run with %sUNITY_NETWORK_ALLOW_CHANGES=true%s.\n' \
+    "$C_YELLOW" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_BOLD" "$CONFIG_FILE" "$C_RESET" "$C_CYAN" "$C_RESET"
+}
+
+# Emits a consistent, colored, actionable error when a required ZeroTier change
+# is blocked because UNITY_NETWORK_ALLOW_CHANGES is not "true".
+require_network_changes_or_explain() {
+  local summary="$1"
+  local manual="$2"
+
+  if [[ "$NETWORK_ALLOW_CHANGES" == "true" ]]; then
+    return 0
+  fi
+
+  die_action "$summary" \
+    "Run this command once with network changes enabled:
+       ${C_CYAN}UNITY_NETWORK_ALLOW_CHANGES=true $SCRIPT_NAME floating${C_RESET}" \
+    "Or make it permanent by adding this line to ${C_BOLD}$CONFIG_FILE${C_RESET}:
+       ${C_CYAN}UNITY_NETWORK_ALLOW_CHANGES=\"true\"${C_RESET}" \
+    "Or perform the ZeroTier step yourself:
+       ${C_CYAN}$manual${C_RESET}
+     ${C_DIM}(Enabling network changes lets this tool join the network and enable its
+     managed routes for you. Authorizing the node on the ZeroTier controller is
+     always a separate manual step.)${C_RESET}"
 }
 
 ensure_network_provider() {
@@ -714,12 +839,17 @@ ensure_network_provider() {
       ;;
     zerotier)
       zerotier_cli_available || die "ZeroTier CLI not found; cannot prepare the floating licensing route."
-      zerotier_joined || die "ZeroTier is not joined to the configured licensing network."
+      if ! zerotier_joined; then
+        require_network_changes_or_explain \
+          "ZeroTier network changes are turned off, so \"floating\" cannot join the configured licensing network ($ZT_NETWORK_NAME)." \
+          "sudo zerotier-cli join $ZT_NETWORK_ID"
+        zerotier_join_network
+      fi
       managed="$(zerotier_managed_state)"
       if [[ "$managed" != "enabled" ]]; then
-        if [[ "$NETWORK_ALLOW_CHANGES" != "true" ]]; then
-          die "ZeroTier managed routes are disabled; set UNITY_NETWORK_ALLOW_CHANGES=true to opt in to enabling them."
-        fi
+        require_network_changes_or_explain \
+          "ZeroTier managed routes are disabled for the configured licensing network ($ZT_NETWORK_NAME), and network changes are turned off." \
+          "zerotier-cli set $ZT_NETWORK_ID allowManaged=1"
         if [[ "$DRY_RUN" == "1" ]]; then
           say "Would enable ZeroTier managed routes for the configured licensing network."
         else
@@ -972,6 +1102,9 @@ print_doctor_text() {
   say "System config access: $DOCTOR_SYSTEM_ACCESS"
   say "Floating template: $DOCTOR_TEMPLATE"
   say "Network provider: $DOCTOR_PROVIDER"
+  if [[ "$NETWORK_PROVIDER" == "zerotier" && "$DOCTOR_PROVIDER" != "joined (managed routes: enabled)" ]]; then
+    network_changes_hint
+  fi
   say "Licensing server reachability: $DOCTOR_SERVER"
   say "Transaction lock: $DOCTOR_LOCK"
   if [[ "$DOCTOR_OK" == "true" ]]; then
@@ -1282,7 +1415,7 @@ return_floating() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--dry-run] [--json] <command>
+Usage: $SCRIPT_NAME [--dry-run] [--json] [--no-color] <command>
 
 Commands:
   status
@@ -1314,6 +1447,8 @@ Options:
       network settings, or leases.
   --json
       Emit machine-readable, redacted output for status or doctor.
+  --no-color
+      Disable colored output (also honored via NO_COLOR or a non-terminal stderr).
   --version
       Print the maintained version.
   --help
@@ -1324,7 +1459,8 @@ Notes:
   - Failed configuration changes restore the captured Unity configuration state.
   - Floating config JSON is validated with jq and must match the configured endpoint.
   - The direct network provider uses the existing operating-system route.
-  - ZeroTier route changes require UNITY_NETWORK_ALLOW_CHANGES=true.
+  - Joining the ZeroTier network and enabling its managed routes requires
+    UNITY_NETWORK_ALLOW_CHANGES=true; status and doctor point this out when it is off.
 EOF
 }
 
@@ -1340,6 +1476,9 @@ main() {
         ;;
       --json)
         OUTPUT_FORMAT="json"
+        ;;
+      --no-color)
+        disable_color
         ;;
       --version|-V)
         printf 'unity-licensing-mode %s\n' "$VERSION"
