@@ -32,7 +32,6 @@ if [[ -z "${NO_COLOR:-}" && -z "${UNITY_LICENSING_MODE_NO_COLOR:-}" ]] && [[ -t 
   C_DIM=$'\033[2m'
   C_RED=$'\033[31m'
   C_YELLOW=$'\033[33m'
-  C_GREEN=$'\033[32m'
   C_CYAN=$'\033[36m'
 else
   C_RESET=""
@@ -40,12 +39,11 @@ else
   C_DIM=""
   C_RED=""
   C_YELLOW=""
-  C_GREEN=""
   C_CYAN=""
 fi
 
 disable_color() {
-  C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_YELLOW=""; C_GREEN=""; C_CYAN=""
+  C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_YELLOW=""; C_CYAN=""
 }
 
 say() {
@@ -189,6 +187,7 @@ LICENSE_CLIENT_PATTERN='/Unity\.Licensing\.Client( |$)'
 MODE_CHANGE_TIMEOUT_SECONDS="${UNITY_LICENSING_MODE_TIMEOUT_SECONDS:-15}"
 SERVER_CONNECT_TIMEOUT_SECONDS="${UNITY_LICENSING_MODE_SERVER_CONNECT_TIMEOUT:-5}"
 SERVER_MAX_TIME_SECONDS="${UNITY_LICENSING_MODE_SERVER_MAX_TIME:-8}"
+ZT_JOIN_TIMEOUT_SECONDS="${UNITY_LICENSING_MODE_ZT_JOIN_TIMEOUT:-10}"
 
 VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || true)"
 DRY_RUN=0
@@ -727,7 +726,7 @@ zerotier_join_network() {
   # Wait for membership to register and for the controller to move the network
   # out of its transient negotiating state. OK and ACCESS_DENIED are terminal;
   # anything else is either still settling or a distinct fault handled below.
-  while (( attempt < 10 )); do
+  while (( attempt < ZT_JOIN_TIMEOUT_SECONDS )); do
     if zerotier_joined; then
       status="$(zerotier_network_status)"
       case "$status" in
@@ -741,7 +740,7 @@ zerotier_join_network() {
   done
 
   if ! zerotier_joined; then
-    die "ZeroTier join for $ZT_NETWORK_ID did not register after 10 seconds."
+    die "ZeroTier join for $ZT_NETWORK_ID did not register after ${ZT_JOIN_TIMEOUT_SECONDS} seconds."
   fi
 
   node_id="$(zerotier_node_id)"

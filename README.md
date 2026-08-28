@@ -98,6 +98,7 @@ installations, and controlled tests:
 | UNITY_LICENSING_MODE_USER_CONFIG_DIR | Override the Unity user configuration directory. |
 | UNITY_LICENSING_MODE_SYSTEM_CONFIG_DIR | Override the Unity system configuration directory. |
 | UNITY_LICENSING_MODE_LICENSE_DIR | Override the Unity license directory. |
+| UNITY_LICENSING_MODE_ZT_JOIN_TIMEOUT | Seconds to wait for a ZeroTier join to register and the controller to respond (default 10). |
 
 Source checkouts default to config/local.conf and runtime/. When the
 executable is installed outside a Git checkout, defaults do not write into the
@@ -296,6 +297,7 @@ Run the local checks from the repository root:
 bash -n bin/unity-licensing-mode
 bash tests/test-command.sh
 bash tests/test-fixtures.sh
+bash tests/test-zerotier.sh
 bash tests/test-release.sh
 git diff --check
 ~~~

@@ -64,5 +64,6 @@ jobs:
           bash -n bin/unity-licensing-mode
           bash tests/test-command.sh
           bash tests/test-fixtures.sh
+          bash tests/test-zerotier.sh
           bash tests/test-release.sh
           git diff --check
