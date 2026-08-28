@@ -207,6 +207,12 @@ TRANSACTION_ACTIVE=0
 LOCK_ACQUIRED=0
 DOCTOR_ISSUES=0
 
+# ZeroTier changes performed by the current invocation. The transaction only
+# snapshots Unity configuration files, so rollback cannot undo these; they are
+# reported instead when a mode change fails.
+ZT_JOINED_BY_US=0
+ZT_MANAGED_SET_BY_US=0
+
 read_config_value() {
   local key="$1"
   [[ -f "$CONFIG_FILE" ]] || return 0
@@ -695,12 +701,18 @@ zerotier_node_id() {
 zerotier_network_status() {
   zerotier_cli_available || return 1
   [[ -n "$ZT_NETWORK_ID" ]] || return 1
-  zerotier-cli listnetworks 2>/dev/null | awk -v nwid="$ZT_NETWORK_ID" '$3 == nwid {print $6}'
+  # Use the structured accessor instead of parsing "listnetworks" columns: the
+  # network-name field is space-separated and variable width, so positional
+  # parsing misreads the status for any multi-word network name. Tolerate a
+  # non-zero exit (transient right after a join) so callers under set -e do not
+  # abort; an empty result is handled as "still negotiating".
+  zerotier-cli get "$ZT_NETWORK_ID" status 2>/dev/null || true
 }
 
 zerotier_join_network() {
   local attempt=0
-  local status
+  local status=""
+  local node_id
 
   if [[ "$DRY_RUN" == "1" ]]; then
     say "Would join ZeroTier network $ZT_NETWORK_ID ($ZT_NETWORK_NAME)."
@@ -710,22 +722,47 @@ zerotier_join_network() {
   say "Joining ZeroTier network $ZT_NETWORK_ID ($ZT_NETWORK_NAME)."
   sudo zerotier-cli join "$ZT_NETWORK_ID" >/dev/null \
     || die "Failed to join ZeroTier network $ZT_NETWORK_ID."
+  ZT_JOINED_BY_US=1
 
+  # Wait for membership to register and for the controller to move the network
+  # out of its transient negotiating state. OK and ACCESS_DENIED are terminal;
+  # anything else is either still settling or a distinct fault handled below.
   while (( attempt < 10 )); do
     if zerotier_joined; then
       status="$(zerotier_network_status)"
-      if [[ "$status" == "OK" ]]; then
-        say "ZeroTier network $ZT_NETWORK_ID is joined and authorized."
-      else
-        warn "ZeroTier network $ZT_NETWORK_ID joined but not yet authorized (status: ${status:-unknown}); authorize node $(zerotier_node_id) on the network controller."
-      fi
-      return 0
+      case "$status" in
+        OK|ACCESS_DENIED)
+          break
+          ;;
+      esac
     fi
     attempt=$((attempt + 1))
     sleep 1
   done
 
-  die "ZeroTier join for $ZT_NETWORK_ID did not register after 10 seconds."
+  if ! zerotier_joined; then
+    die "ZeroTier join for $ZT_NETWORK_ID did not register after 10 seconds."
+  fi
+
+  node_id="$(zerotier_node_id)"
+  case "$status" in
+    OK)
+      say "ZeroTier network $ZT_NETWORK_ID is joined and authorized."
+      ;;
+    ACCESS_DENIED)
+      warn "ZeroTier network $ZT_NETWORK_ID joined, but the controller has not authorized node ${node_id:-this node}; approve it on the ZeroTier network controller."
+      ;;
+    REQUESTING_CONFIGURATION|"")
+      warn "ZeroTier network $ZT_NETWORK_ID joined; still negotiating with the controller. If node ${node_id:-this node} is pre-authorized it will connect shortly; otherwise approve it on the network controller."
+      ;;
+    NOT_FOUND)
+      warn "ZeroTier controller does not recognize network $ZT_NETWORK_ID; check UNITY_NETWORK_ID."
+      ;;
+    *)
+      warn "ZeroTier network $ZT_NETWORK_ID joined with unexpected status '$status'; run 'zerotier-cli listnetworks' to inspect."
+      ;;
+  esac
+  return 0
 }
 
 zerotier_managed_state() {
@@ -820,7 +857,7 @@ require_network_changes_or_explain() {
 
   die_action "$summary" \
     "Run this command once with network changes enabled:
-       ${C_CYAN}UNITY_NETWORK_ALLOW_CHANGES=true $SCRIPT_NAME floating${C_RESET}" \
+       ${C_CYAN}UNITY_NETWORK_ALLOW_CHANGES=true $0 floating${C_RESET}" \
     "Or make it permanent by adding this line to ${C_BOLD}$CONFIG_FILE${C_RESET}:
        ${C_CYAN}UNITY_NETWORK_ALLOW_CHANGES=\"true\"${C_RESET}" \
     "Or perform the ZeroTier step yourself:
@@ -855,6 +892,7 @@ ensure_network_provider() {
         else
           say "Enabling ZeroTier managed routes for the configured licensing network."
           zerotier-cli set "$ZT_NETWORK_ID" allowManaged=1
+          ZT_MANAGED_SET_BY_US=1
         fi
       fi
       ;;
@@ -1247,9 +1285,25 @@ rollback_transaction() {
     write_transaction_metadata rollback_failed
     warn "Mode change failed and automatic rollback was incomplete; inspect transaction metadata at $TRANSACTION_DIR."
   fi
+  report_unreverted_network_changes
   TRANSACTION_ACTIVE=0
   set -e
   return "$original_status"
+}
+
+# The transaction only snapshots Unity configuration files, so any ZeroTier
+# change this invocation made is still in place after a rollback. Report it and
+# the exact commands to undo it so the node is not left in a partial state.
+report_unreverted_network_changes() {
+  [[ "$ZT_JOINED_BY_US" -eq 1 || "$ZT_MANAGED_SET_BY_US" -eq 1 ]] || return 0
+
+  warn "ZeroTier changes made during this run were NOT reverted:"
+  if [[ "$ZT_JOINED_BY_US" -eq 1 ]]; then
+    warn "  - this node is still joined to $ZT_NETWORK_ID; undo with: sudo zerotier-cli leave $ZT_NETWORK_ID"
+  fi
+  if [[ "$ZT_MANAGED_SET_BY_US" -eq 1 ]]; then
+    warn "  - managed routes are still enabled; undo with: zerotier-cli set $ZT_NETWORK_ID allowManaged=0"
+  fi
 }
 
 commit_transaction() {

@@ -60,12 +60,13 @@ directory on PATH.
 | Unity Hub and Unity Editor | Mode changes | Save work before running personal or floating. |
 | jq | floating, template checks, and doctor validation | Floating JSON validation is mandatory in 0.1.0. |
 | curl | Server reachability in doctor | The check is bounded and its output is suppressed. |
-| ZeroTier and zerotier-cli | floating with the zerotier provider | The machine must already be joined and authorized. |
+| ZeroTier and zerotier-cli | floating with the zerotier provider | The node must be authorized on the network controller. With UNITY_NETWORK_ALLOW_CHANGES=true, floating performs the join itself; otherwise the machine must already be a member. |
 | Unity license CLI | return-floating | Configure its path with UNITY_LICENSE_CLI. |
 
 Commands that touch /Library/Application Support/Unity may request
-administrator privileges through sudo. The tool never joins or authorizes a
-network.
+administrator privileges through sudo. The tool never authorizes a node on the
+network controller, and it joins the configured network only when
+UNITY_NETWORK_ALLOW_CHANGES=true.
 
 ## Configuration
 
@@ -177,10 +178,11 @@ ZeroTier route changes are opt-in through
 UNITY_NETWORK_ALLOW_CHANGES=true. With that set, floating joins the configured
 network (sudo zerotier-cli join) when the node is not already a member and
 enables its managed routes. It waits up to ten seconds for the membership to
-register and warns if the network status is not yet OK. Authorization on the
-network controller is never performed automatically; a joined-but-unauthorized
-node still needs to be approved there. With the flag left at false the command
-neither joins nor changes any network.
+register and the controller to respond, then reports the resulting network
+status (authorized, awaiting authorization, still negotiating, or an unexpected
+state). Authorization on the network controller is never performed
+automatically; a joined-but-unauthorized node still needs to be approved there.
+With the flag left at false the command neither joins nor changes any network.
 
 ## How switching works
 
@@ -234,8 +236,9 @@ For a floating setup:
 
 - doctor should report a valid floating template, the expected provider state,
   and reachable server when those values are configured.
-- With ZeroTier, the machine must already be joined and authorized. If managed
-  routes are disabled, opt in explicitly or enable the route through the
+- With ZeroTier, the node must be authorized on the network controller, and the
+  machine must already be joined unless UNITY_NETWORK_ALLOW_CHANGES=true. If
+  managed routes are disabled, opt in explicitly or enable the route through the
   authorized network administration workflow.
 - A reachable HTTP endpoint proves server reachability only; it does not prove
   that Unity acquired a floating lease.
