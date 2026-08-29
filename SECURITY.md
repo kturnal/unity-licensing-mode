@@ -16,6 +16,6 @@ Keep these values and files private:
 - private licensing-server URLs and network identifiers
 - floating-lease return tokens
 
-The supported token flow reads from stdin or an interactive prompt. The positional token form remains only for compatibility and may expose the token to shell history or process inspection.
+The helper reads tokens from stdin or an interactive prompt. By default it passes the captured token as the argument required by Unity.Licensing.Client, which may briefly expose it to process inspection. The positional token form remains only for compatibility and can additionally expose the token to shell history. Use `UNITY_LICENSE_CLI_MODE=stdin` only with a compatible custom wrapper.
 
 This project does not activate licenses, operate a licensing server, join or authorize networks, or bypass Unity licensing.

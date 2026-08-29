@@ -22,6 +22,7 @@ CLI_ARGS_LOG="$TEST_ROOT/cli-args"
 CLI_TOKEN_LOG="$TEST_ROOT/cli-token"
 JQ_CALL_LOG="$TEST_ROOT/jq-calls"
 FAKE_JQ_FAIL_SYSTEM_AFTER_FIRST=0
+CLI_MODE_OVERRIDE=""
 
 cleanup() {
   rm -rf "$TEST_ROOT"
@@ -65,6 +66,10 @@ write_fake_jq() {
       'exec "$FAKE_JQ_REAL" "$@"' >> "$FAKE_BIN/jq"
   else
     printf '%s\n' \
+      'call_count=0' \
+      'if [[ -f "$FAKE_JQ_CALL_LOG" ]]; then call_count="$(<"$FAKE_JQ_CALL_LOG")"; fi' \
+      'call_count=$((call_count + 1))' \
+      'printf "%s" "$call_count" > "$FAKE_JQ_CALL_LOG"' \
       'expected=""' \
       'target=""' \
       'while [[ "$#" -gt 0 ]]; do' \
@@ -74,6 +79,7 @@ write_fake_jq() {
       '    *) target="$1"; shift; target="$1"; shift ;;' \
       '  esac' \
       'done' \
+      'if [[ "$FAKE_JQ_FAIL_SYSTEM_AFTER_FIRST" == "1" && "$call_count" -gt 1 && "$(basename "$target")" == "services-config.json" ]]; then exit 1; fi' \
       'grep -q "{" "$target"' \
       'grep -Fq "\"licensingServiceBaseUrl\":\"$expected\"" "$target"' >> "$FAKE_BIN/jq"
   fi
@@ -90,24 +96,45 @@ write_fake_pgrep() {
   chmod +x "$FAKE_BIN/pgrep"
 }
 
+write_fake_gnu_stat() {
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ "$1" == "-f" ]]; then' \
+    '  printf "  File: fake-config\\n    Type: fake-filesystem\\n"' \
+    '  exit 1' \
+    'fi' \
+    'if [[ "$1" == "-c" ]]; then' \
+    '  printf "600\\n"' \
+    '  exit 0' \
+    'fi' \
+    'exit 1' > "$FAKE_BIN/stat"
+  chmod +x "$FAKE_BIN/stat"
+}
+
 write_fake_cli() {
   printf '%s\n' '#!/usr/bin/env bash' 'set -e' > "$CLI_FILE"
   printf '%s\n' \
     'printf "%s" "$*" > "$CLI_ARGS_LOG"' \
-    'IFS= read -r token || true' \
+    'token=""' \
+    'if [[ "$#" -eq 1 ]]; then IFS= read -r token || true; fi' \
     'printf "%s" "$token" > "$CLI_TOKEN_LOG"' >> "$CLI_FILE"
   chmod +x "$CLI_FILE"
 }
 
 write_config() {
+  local provider="${1:-direct}"
+  local cli_mode="${2-stdin}"
+
   printf '%s\n' \
-    'UNITY_NETWORK_PROVIDER="direct"' \
+    "UNITY_NETWORK_PROVIDER=\"$provider\"" \
     "UNITY_NETWORK_ID=\"$NETWORK_ID\"" \
     "UNITY_NETWORK_NAME=\"$NETWORK_NAME\"" \
     'UNITY_NETWORK_ALLOW_CHANGES="false"' \
     "UNITY_LICENSE_SERVER_URL=\"$SERVER_URL\"" \
-    "UNITY_LICENSE_CLI=\"$CLI_FILE\"" \
-    'UNITY_LICENSE_CLI_MODE="stdin"' > "$CONFIG_FILE"
+    "UNITY_LICENSE_CLI=\"$CLI_FILE\"" > "$CONFIG_FILE"
+  if [[ -n "$cli_mode" ]]; then
+    printf 'UNITY_LICENSE_CLI_MODE="%s"\n' "$cli_mode" >> "$CONFIG_FILE"
+  fi
   chmod 600 "$CONFIG_FILE"
 }
 
@@ -129,6 +156,7 @@ run_tool() {
     FAKE_JQ_FAIL_SYSTEM_AFTER_FIRST="$FAKE_JQ_FAIL_SYSTEM_AFTER_FIRST" \
     CLI_ARGS_LOG="$CLI_ARGS_LOG" \
     CLI_TOKEN_LOG="$CLI_TOKEN_LOG" \
+    UNITY_LICENSE_CLI_MODE="$CLI_MODE_OVERRIDE" \
     PATH="$FAKE_BIN:$ORIGINAL_PATH" \
     "$SCRIPT" "$@"
 }
@@ -149,6 +177,13 @@ assert_not_contains "$status_json" "$NETWORK_NAME"
 if [[ -n "$REAL_JQ" ]]; then
   printf '%s\n' "$status_json" | "$REAL_JQ" -e . >/dev/null
 fi
+
+# GNU stat may emit non-mode filesystem output before failing the BSD syntax.
+write_fake_gnu_stat
+gnu_stat_json="$(run_tool --json status)"
+assert_contains "$gnu_stat_json" '"configuration_permissions": "secure"'
+assert_contains "$gnu_stat_json" '"network_provider": "direct"'
+rm -f "$FAKE_BIN/stat"
 
 # Lease filenames are also redacted from the human-readable status report.
 touch "$LICENSE_DIR/sensitive-lease-token.xml"
@@ -182,7 +217,17 @@ mkdir "$STATE_DIR/.lock"
 if run_tool --dry-run personal >/dev/null 2>&1; then
   fail 'held lock unexpectedly allowed an operation'
 fi
+lock_doctor_json="$(run_tool --json doctor)"
+assert_contains "$lock_doctor_json" '"transaction_lock": "held"'
+assert_contains "$lock_doctor_json" '"ok": false'
 rmdir "$STATE_DIR/.lock"
+
+# Invalid provider settings are reported by doctor instead of terminating it.
+write_config invalid stdin
+invalid_doctor_json="$(run_tool --json doctor)"
+assert_contains "$invalid_doctor_json" '"network_provider": "invalid"'
+assert_contains "$invalid_doctor_json" '"ok": false'
+write_config
 
 # A dry-run validates the eligible candidate but does not create state or config files.
 printf '%s\n' '{"licensingServiceBaseUrl":"http://wrong.example.test:1554"}' > "$USER_CONFIG_DIR/services-config.json"
@@ -201,6 +246,17 @@ assert_file_equals "$SYSTEM_CONFIG_DIR/services-config.json" "$(valid_config | t
 assert_file_equals "$STATE_DIR/services-config.user.disabled.json" '{"licensingServiceBaseUrl":"http://wrong.example.test:1554"}'
 assert_file_equals "$STATE_DIR/services-config.floating.template.json" "$(valid_config | tr -d '\n')"
 find "$STATE_DIR/transactions" -name metadata -type f -print -exec grep -q '^status=committed$' {} \; >/dev/null || fail 'missing committed transaction metadata'
+
+# Personal mode replaces a stale optional template instead of refusing to disable floating mode.
+rm -rf "$STATE_DIR" "$SYSTEM_CONFIG_DIR" "$USER_CONFIG_DIR"
+mkdir -p "$STATE_DIR" "$USER_CONFIG_DIR" "$SYSTEM_CONFIG_DIR"
+printf '%s\n' '{"licensingServiceBaseUrl":"http://stale.example.test:1554"}' > "$STATE_DIR/services-config.floating.template.json"
+valid_config > "$SYSTEM_CONFIG_DIR/services-config.json"
+personal_output="$(run_tool personal 2>&1)"
+assert_contains "$personal_output" 'Personal mode is active.'
+[[ ! -f "$SYSTEM_CONFIG_DIR/services-config.json" ]] || fail 'personal mode left the system config active'
+assert_file_equals "$STATE_DIR/services-config.system.disabled.json" "$(valid_config | tr -d '\n')"
+assert_file_equals "$STATE_DIR/services-config.floating.template.json" "$(valid_config | tr -d '\n')"
 
 # A failed post-install validation restores the original active user config and removes new state.
 rm -rf "$STATE_DIR" "$SYSTEM_CONFIG_DIR" "$USER_CONFIG_DIR"
@@ -221,6 +277,12 @@ rollback_output="$(<"$TEST_ROOT/rollback-output")"
 assert_contains "$rollback_output" 'original Unity configuration was restored'
 find "$STATE_DIR/transactions" -name metadata -type f -print -exec grep -q '^status=rolled_back$' {} \; >/dev/null || fail 'missing rolled-back transaction metadata'
 
+# Commands that do not edit configuration use a lock but create no transaction snapshots.
+rm -rf "$STATE_DIR"
+mkdir -p "$STATE_DIR"
+run_tool reload-client >/dev/null
+[[ ! -d "$STATE_DIR/transactions" ]] || fail 'reload-client created an unnecessary configuration transaction'
+
 # Stdin token input reaches the CLI through stdin, while the process arguments stay token-free.
 rm -rf "$STATE_DIR"
 mkdir -p "$STATE_DIR"
@@ -235,6 +297,32 @@ fi
 [[ "$token_status" -eq 0 ]] || fail "return-floating fixture failed with status $token_status: $(<"$TEST_ROOT/token-output")"
 assert_file_equals "$CLI_ARGS_LOG" '--return-floating'
 assert_file_equals "$CLI_TOKEN_LOG" 'sensitive-floating-token'
+
+# The environment override wins over the configured CLI mode.
+CLI_MODE_OVERRIDE="argument"
+: > "$CLI_ARGS_LOG"
+: > "$CLI_TOKEN_LOG"
+printf '%s\n' 'environment-override-token' | run_tool return-floating >/dev/null 2>&1
+assert_file_equals "$CLI_ARGS_LOG" '--return-floating environment-override-token'
+assert_file_equals "$CLI_TOKEN_LOG" ''
+[[ ! -d "$STATE_DIR/transactions" ]] || fail 'return-floating created an unnecessary configuration transaction'
+CLI_MODE_OVERRIDE=""
+
+# The deprecated positional token is forwarded to an argument-mode CLI.
+write_config direct argument
+: > "$CLI_ARGS_LOG"
+: > "$CLI_TOKEN_LOG"
+run_tool return-floating 'compatibility-token' >/dev/null 2>&1
+assert_file_equals "$CLI_ARGS_LOG" '--return-floating compatibility-token'
+assert_file_equals "$CLI_TOKEN_LOG" ''
+
+# Without an explicit mode, the Unity Licensing Client-compatible argument mode is used.
+write_config direct ''
+: > "$CLI_ARGS_LOG"
+: > "$CLI_TOKEN_LOG"
+printf '%s\n' 'default-mode-token' | run_tool return-floating >/dev/null 2>&1
+assert_file_equals "$CLI_ARGS_LOG" '--return-floating default-mode-token'
+assert_file_equals "$CLI_TOKEN_LOG" ''
 
 # Dry-run return does not prompt for or invoke the configured CLI.
 rm -f "$CLI_ARGS_LOG" "$CLI_TOKEN_LOG"
