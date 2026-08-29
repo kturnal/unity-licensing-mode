@@ -60,12 +60,13 @@ directory on PATH.
 | Unity Hub and Unity Editor | Mode changes | Save work before running personal or floating. |
 | jq | floating, template checks, and doctor validation | Floating JSON validation is mandatory in 0.1.0. |
 | curl | Server reachability in doctor | The check is bounded and its output is suppressed. |
-| ZeroTier and zerotier-cli | floating with the zerotier provider | The machine must already be joined and authorized. |
+| ZeroTier and zerotier-cli | floating with the zerotier provider | The node must be authorized on the network controller. With UNITY_NETWORK_ALLOW_CHANGES=true, floating performs the join itself; otherwise the machine must already be a member. |
 | Unity license CLI | return-floating | Configure its path with UNITY_LICENSE_CLI. |
 
 Commands that touch /Library/Application Support/Unity may request
-administrator privileges through sudo. The tool never joins or authorizes a
-network.
+administrator privileges through sudo. The tool never authorizes a node on the
+network controller, and it joins the configured network only when
+UNITY_NETWORK_ALLOW_CHANGES=true.
 
 ## Configuration
 
@@ -77,7 +78,7 @@ protect it with mode 600.
 | UNITY_NETWORK_PROVIDER | floating | direct for an existing route or zerotier for ZeroTier. | zerotier |
 | UNITY_NETWORK_ID | floating with ZeroTier | ZeroTier network ID. | None |
 | UNITY_NETWORK_NAME | floating with ZeroTier | Human-readable local label. | None |
-| UNITY_NETWORK_ALLOW_CHANGES | floating with ZeroTier | Opts in to enabling managed ZeroTier routes. | false |
+| UNITY_NETWORK_ALLOW_CHANGES | floating with ZeroTier | Opts in to joining the configured ZeroTier network and enabling its managed routes. | false |
 | UNITY_LICENSE_SERVER_URL | floating | Expected http:// or https:// endpoint. | None |
 | UNITY_LICENSE_CLI | return-floating | Path to the local Unity license CLI. | /usr/local/bin/unity-license |
 | UNITY_LICENSE_CLI_MODE | return-floating | stdin keeps the token out of process arguments; argument is a compatibility fallback. | stdin |
@@ -97,6 +98,7 @@ installations, and controlled tests:
 | UNITY_LICENSING_MODE_USER_CONFIG_DIR | Override the Unity user configuration directory. |
 | UNITY_LICENSING_MODE_SYSTEM_CONFIG_DIR | Override the Unity system configuration directory. |
 | UNITY_LICENSING_MODE_LICENSE_DIR | Override the Unity license directory. |
+| UNITY_LICENSING_MODE_ZT_JOIN_TIMEOUT | Seconds to wait for a ZeroTier join to register and the controller to respond (default 10). |
 
 Source checkouts default to config/local.conf and runtime/. When the
 executable is installed outside a Git checkout, defaults do not write into the
@@ -128,6 +130,12 @@ CLI:
 ./bin/unity-licensing-mode --dry-run reload-client
 ./bin/unity-licensing-mode --dry-run return-floating
 ~~~
+
+Output is colored when stderr is a terminal. Disable it with --no-color, the
+NO_COLOR environment variable, or by redirecting output. When
+UNITY_NETWORK_ALLOW_CHANGES is off, status, doctor, and floating highlight that
+the ZeroTier network will not be joined or configured and print the exact line
+to add or the command to prefix.
 
 For a secure floating-lease return:
 
@@ -168,8 +176,14 @@ licensingServiceBaseUrl exactly matches UNITY_LICENSE_SERVER_URL. A malformed,
 personal, or wrong-endpoint file is not selected.
 
 ZeroTier route changes are opt-in through
-UNITY_NETWORK_ALLOW_CHANGES=true. The command never automatically joins or
-authorizes a network.
+UNITY_NETWORK_ALLOW_CHANGES=true. With that set, floating joins the configured
+network (sudo zerotier-cli join) when the node is not already a member and
+enables its managed routes. It waits up to ten seconds for the membership to
+register and the controller to respond, then reports the resulting network
+status (authorized, awaiting authorization, still negotiating, or an unexpected
+state). Authorization on the network controller is never performed
+automatically; a joined-but-unauthorized node still needs to be approved there.
+With the flag left at false the command neither joins nor changes any network.
 
 ## How switching works
 
@@ -223,8 +237,9 @@ For a floating setup:
 
 - doctor should report a valid floating template, the expected provider state,
   and reachable server when those values are configured.
-- With ZeroTier, the machine must already be joined and authorized. If managed
-  routes are disabled, opt in explicitly or enable the route through the
+- With ZeroTier, the node must be authorized on the network controller, and the
+  machine must already be joined unless UNITY_NETWORK_ALLOW_CHANGES=true. If
+  managed routes are disabled, opt in explicitly or enable the route through the
   authorized network administration workflow.
 - A reachable HTTP endpoint proves server reachability only; it does not prove
   that Unity acquired a floating lease.
@@ -282,6 +297,7 @@ Run the local checks from the repository root:
 bash -n bin/unity-licensing-mode
 bash tests/test-command.sh
 bash tests/test-fixtures.sh
+bash tests/test-zerotier.sh
 bash tests/test-release.sh
 git diff --check
 ~~~

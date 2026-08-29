@@ -58,11 +58,19 @@ jobs:
             exit 1
           fi
 
+      # The behavioral fixtures drive the tool through real chmod/stat and
+      # transaction file handling. Git Bash on Windows does not provide POSIX
+      # permission semantics (a chmod 600 config still reads back as world
+      # readable), and the tool itself is macOS-only, so this leg would exercise
+      # a configuration that cannot occur. Windows still runs checkout and
+      # ShellCheck above, which is the portability check that matters here.
       - name: Run fixture tests
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           bash -n bin/unity-licensing-mode
           bash tests/test-command.sh
           bash tests/test-fixtures.sh
+          bash tests/test-zerotier.sh
           bash tests/test-release.sh
           git diff --check
