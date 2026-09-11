@@ -1131,7 +1131,11 @@ run_doctor_checks() {
   fi
 
   if [[ -e "$LOCK_DIR" ]]; then
-    DOCTOR_LOCK="held"
+    if lock_is_stale; then
+      DOCTOR_LOCK="held (stale; pid $(lock_holder_pid) is not running and will be cleared on the next run)"
+    else
+      DOCTOR_LOCK="held"
+    fi
     doctor_add_issue
   else
     DOCTOR_LOCK="available"
@@ -1335,10 +1339,46 @@ release_lock() {
   LOCK_ACQUIRED=0
 }
 
+lock_holder_pid() {
+  local metadata="$LOCK_DIR/metadata"
+  local line
+  [[ -f "$metadata" ]] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      pid=*)
+        printf '%s' "${line#pid=}"
+        return 0
+        ;;
+    esac
+  done < "$metadata"
+  return 1
+}
+
+# A lock is stale only when we can read a pid from its metadata and that pid
+# is no longer running; a lock with no readable pid is treated as held so we
+# never guess our way past a concurrent operation.
+lock_is_stale() {
+  local pid
+  pid="$(lock_holder_pid)" || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  ! kill -0 "$pid" 2>/dev/null
+}
+
+clear_stale_lock() {
+  local pid
+  lock_is_stale || return 1
+  pid="$(lock_holder_pid)"
+  warn "Clearing a stale lock left by pid $pid, which is no longer running."
+  rm -f "$LOCK_DIR/metadata" 2>/dev/null || true
+  rmdir "$LOCK_DIR" 2>/dev/null || return 1
+}
+
 acquire_lock() {
   local command="$1"
   if [[ "$DRY_RUN" == "1" ]]; then
-    [[ ! -e "$LOCK_DIR" ]] || die "Another unity-licensing-mode operation already holds the lock."
+    if [[ -e "$LOCK_DIR" ]] && ! lock_is_stale; then
+      die "Another unity-licensing-mode operation already holds the lock."
+    fi
     say "Dry run: operation lock is available; no lock was created."
     return
   fi
@@ -1346,7 +1386,8 @@ acquire_lock() {
   ensure_dir "$MANAGED_DIR"
   ensure_dir "$(dirname "$LOCK_DIR")"
   if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    die "Another unity-licensing-mode operation already holds the lock."
+    clear_stale_lock || die "Another unity-licensing-mode operation already holds the lock."
+    mkdir "$LOCK_DIR" 2>/dev/null || die "Another unity-licensing-mode operation already holds the lock."
   fi
   LOCK_ACQUIRED=1
   {
