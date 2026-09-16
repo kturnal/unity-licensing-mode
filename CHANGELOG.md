@@ -24,4 +24,5 @@ Release tags use the immutable `vMAJOR.MINOR.PATCH` form and must match `VERSION
   cleared automatically instead of permanently blocking every future
   command with "Another unity-licensing-mode operation already holds the
   lock." `doctor` now reports a stale lock distinctly from a genuinely held
-  one.
+  one. Incomplete lock metadata left by an interruption is also recoverable
+  after a short grace period.
