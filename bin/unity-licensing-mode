@@ -579,7 +579,7 @@ seed_template_if_missing() {
       fi
       warn "The preserved floating template does not match the configured licensing server; searching for a valid replacement."
     else
-      return
+      return 0
     fi
   fi
 

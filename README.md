@@ -247,6 +247,11 @@ For a floating setup:
   authorized network administration workflow.
 - A reachable HTTP endpoint proves server reachability only; it does not prove
   that Unity acquired a floating lease.
+- If the server or network becomes reachable only after Unity's first lease
+  attempt, close Unity Hub and the Editor, run `reload-client`, and then reopen
+  Unity. Confirm success from a new `AcquireFloatingLease state: "Created"`
+  client-log event and a current floating lease file; do not rely on endpoint
+  reachability alone.
 - If the template is rejected, configure Unity for floating licensing once and
   retry. The helper restores an existing template; it does not invent one.
 - If jq is missing, install it before running floating.
