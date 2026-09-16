@@ -289,6 +289,12 @@ assert_file_equals "$STATE_DIR/services-config.user.disabled.json" '{"licensingS
 assert_file_equals "$STATE_DIR/services-config.floating.template.json" "$(valid_config | tr -d '\n')"
 find "$STATE_DIR/transactions" -name metadata -type f -print -exec grep -q '^status=committed$' {} \; >/dev/null || fail 'missing committed transaction metadata'
 
+# A valid preserved template must return success and allow later mode-change
+# steps to run. A bare `return` here inherits the failed negated validation
+# condition and silently aborts the command with status 1.
+repeat_floating_output="$(run_tool --dry-run floating)"
+assert_contains "$repeat_floating_output" 'Would verify the installed floating configuration'
+
 # Personal mode replaces a stale optional template instead of refusing to disable floating mode.
 rm -rf "$STATE_DIR" "$SYSTEM_CONFIG_DIR" "$USER_CONFIG_DIR"
 mkdir -p "$STATE_DIR" "$USER_CONFIG_DIR" "$SYSTEM_CONFIG_DIR"
