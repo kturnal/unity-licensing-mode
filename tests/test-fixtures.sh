@@ -23,6 +23,7 @@ CLI_TOKEN_LOG="$TEST_ROOT/cli-token"
 JQ_CALL_LOG="$TEST_ROOT/jq-calls"
 FAKE_JQ_FAIL_SYSTEM_AFTER_FIRST=0
 CLI_MODE_OVERRIDE=""
+LOCK_INCOMPLETE_GRACE_SECONDS=""
 
 cleanup() {
   rm -rf "$TEST_ROOT"
@@ -157,6 +158,7 @@ run_tool() {
     CLI_ARGS_LOG="$CLI_ARGS_LOG" \
     CLI_TOKEN_LOG="$CLI_TOKEN_LOG" \
     UNITY_LICENSE_CLI_MODE="$CLI_MODE_OVERRIDE" \
+    UNITY_LICENSING_MODE_LOCK_INCOMPLETE_GRACE_SECONDS="$LOCK_INCOMPLETE_GRACE_SECONDS" \
     PATH="$FAKE_BIN:$ORIGINAL_PATH" \
     "$SCRIPT" "$@"
 }
@@ -221,6 +223,46 @@ lock_doctor_json="$(run_tool --json doctor)"
 assert_contains "$lock_doctor_json" '"transaction_lock": "held"'
 assert_contains "$lock_doctor_json" '"ok": false'
 rmdir "$STATE_DIR/.lock"
+
+# An interrupted process can leave the directory before it writes metadata.
+# It remains held during the grace period, then is recoverable without
+# removing it during a dry run.
+mkdir "$STATE_DIR/.lock"
+LOCK_INCOMPLETE_GRACE_SECONDS=0
+incomplete_doctor_json="$(run_tool --json doctor)"
+assert_contains "$incomplete_doctor_json" '"transaction_lock": "held (incomplete and older than 0 seconds;'
+if run_tool --dry-run personal >/dev/null 2>&1; then
+  :
+else
+  fail 'a dry run unexpectedly refused to run over an abandoned incomplete lock'
+fi
+[[ -d "$STATE_DIR/.lock" ]] || fail 'a dry run removed the incomplete lock directory'
+incomplete_output="$(run_tool reload-client 2>&1)"
+assert_contains "$incomplete_output" 'Clearing an incomplete lock older than 0 seconds'
+incomplete_cleared_json="$(run_tool --json doctor)"
+assert_contains "$incomplete_cleared_json" '"transaction_lock": "available"'
+LOCK_INCOMPLETE_GRACE_SECONDS=""
+
+# A lock left behind by a process that is no longer running is stale, not
+# held: doctor reports it distinctly and a real run clears it automatically
+# instead of refusing every future operation forever.
+( exit 0 ) &
+dead_pid=$!
+wait "$dead_pid" 2>/dev/null || true
+mkdir "$STATE_DIR/.lock"
+printf 'pid=%s\ncommand=personal\nstarted_at=2020-01-01T00:00:00Z\n' "$dead_pid" > "$STATE_DIR/.lock/metadata"
+stale_doctor_json="$(run_tool --json doctor)"
+assert_contains "$stale_doctor_json" '"transaction_lock": "held (stale;'
+if run_tool --dry-run personal >/dev/null 2>&1; then
+  :
+else
+  fail 'a dry run unexpectedly refused to run over a stale lock'
+fi
+[[ -d "$STATE_DIR/.lock" ]] || fail 'a dry run removed the stale lock directory'
+stale_output="$(run_tool reload-client 2>&1)"
+assert_contains "$stale_output" 'Clearing a stale lock'
+cleared_doctor_json="$(run_tool --json doctor)"
+assert_contains "$cleared_doctor_json" '"transaction_lock": "available"'
 
 # Invalid provider settings are reported by doctor instead of terminating it.
 write_config invalid stdin

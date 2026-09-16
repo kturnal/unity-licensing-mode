@@ -19,4 +19,10 @@ Release tags use the immutable `vMAJOR.MINOR.PATCH` form and must match `VERSION
 
 ## Unreleased
 
-Future changes will be listed here before the next versioned release.
+- Fixed the operation lock so a lock left behind by a process that is no
+  longer running (a crash, a killed terminal) is detected as stale and
+  cleared automatically instead of permanently blocking every future
+  command with "Another unity-licensing-mode operation already holds the
+  lock." `doctor` now reports a stale lock distinctly from a genuinely held
+  one. Incomplete lock metadata left by an interruption is also recoverable
+  after a short grace period.

@@ -170,6 +170,10 @@ default_license_dir() {
 CONFIG_FILE="${UNITY_LICENSING_MODE_CONFIG_FILE:-$(default_config_file)}"
 MANAGED_DIR="${UNITY_LICENSING_MODE_STATE_DIR:-$(default_state_dir)}"
 LOCK_DIR="${UNITY_LICENSING_MODE_LOCK_DIR:-$MANAGED_DIR/.lock}"
+# A lock directory is created before its metadata. Give a concurrent process a
+# short window to finish that write before treating an incomplete lock as left
+# behind by an interrupted invocation.
+LOCK_INCOMPLETE_GRACE_SECONDS="${UNITY_LICENSING_MODE_LOCK_INCOMPLETE_GRACE_SECONDS:-5}"
 
 USER_CONFIG_DIR="${UNITY_LICENSING_MODE_USER_CONFIG_DIR:-$(default_user_config_dir)}"
 USER_CONFIG="$USER_CONFIG_DIR/services-config.json"
@@ -1131,7 +1135,13 @@ run_doctor_checks() {
   fi
 
   if [[ -e "$LOCK_DIR" ]]; then
-    DOCTOR_LOCK="held"
+    if lock_is_stale; then
+      DOCTOR_LOCK="held (stale; pid $(lock_holder_pid) is not running and will be cleared on the next run)"
+    elif lock_is_abandoned_incomplete; then
+      DOCTOR_LOCK="held (incomplete and older than ${LOCK_INCOMPLETE_GRACE_SECONDS} seconds; will be cleared on the next run)"
+    else
+      DOCTOR_LOCK="held"
+    fi
     doctor_add_issue
   else
     DOCTOR_LOCK="available"
@@ -1335,10 +1345,83 @@ release_lock() {
   LOCK_ACQUIRED=0
 }
 
+lock_holder_pid() {
+  local metadata="$LOCK_DIR/metadata"
+  local line
+  [[ -f "$metadata" ]] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      pid=*)
+        printf '%s' "${line#pid=}"
+        return 0
+        ;;
+    esac
+  done < "$metadata"
+  return 1
+}
+
+lock_metadata_is_incomplete() {
+  local pid
+  pid="$(lock_holder_pid)" || return 0
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  return 1
+}
+
+lock_directory_modified_epoch() {
+  local modified
+  # GNU coreutils uses "stat -c %Y"; BSD/macOS uses "stat -f %m". Try GNU
+  # first because GNU stat -f can emit unrelated filesystem details.
+  modified="$(stat -c '%Y' "$LOCK_DIR" 2>/dev/null || stat -f '%m' "$LOCK_DIR" 2>/dev/null || true)"
+  [[ "$modified" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$modified"
+}
+
+# A numeric pid is the preferred proof of a stale lock. An interrupted process
+# can die after mkdir succeeds but before metadata is written, however, so an
+# incomplete lock becomes recoverable after a short grace period.
+lock_is_stale() {
+  local pid
+  pid="$(lock_holder_pid)" || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  ! kill -0 "$pid" 2>/dev/null
+}
+
+lock_is_abandoned_incomplete() {
+  local modified
+  local now
+
+  lock_metadata_is_incomplete || return 1
+  [[ "$LOCK_INCOMPLETE_GRACE_SECONDS" =~ ^[0-9]+$ ]] || return 1
+  modified="$(lock_directory_modified_epoch)" || return 1
+  now="$(date +%s 2>/dev/null || true)"
+  [[ "$now" =~ ^[0-9]+$ ]] || return 1
+  (( now - modified >= LOCK_INCOMPLETE_GRACE_SECONDS ))
+}
+
+lock_is_recoverable() {
+  lock_is_stale || lock_is_abandoned_incomplete
+}
+
+clear_recoverable_lock() {
+  local pid
+  if lock_is_stale; then
+    pid="$(lock_holder_pid)"
+    warn "Clearing a stale lock left by pid $pid, which is no longer running."
+  elif lock_is_abandoned_incomplete; then
+    warn "Clearing an incomplete lock older than ${LOCK_INCOMPLETE_GRACE_SECONDS} seconds."
+  else
+    return 1
+  fi
+  rm -f "$LOCK_DIR/metadata" 2>/dev/null || true
+  rmdir "$LOCK_DIR" 2>/dev/null || return 1
+}
+
 acquire_lock() {
   local command="$1"
   if [[ "$DRY_RUN" == "1" ]]; then
-    [[ ! -e "$LOCK_DIR" ]] || die "Another unity-licensing-mode operation already holds the lock."
+    if [[ -e "$LOCK_DIR" ]] && ! lock_is_recoverable; then
+      die "Another unity-licensing-mode operation already holds the lock."
+    fi
     say "Dry run: operation lock is available; no lock was created."
     return
   fi
@@ -1346,7 +1429,8 @@ acquire_lock() {
   ensure_dir "$MANAGED_DIR"
   ensure_dir "$(dirname "$LOCK_DIR")"
   if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    die "Another unity-licensing-mode operation already holds the lock."
+    clear_recoverable_lock || die "Another unity-licensing-mode operation already holds the lock."
+    mkdir "$LOCK_DIR" 2>/dev/null || die "Another unity-licensing-mode operation already holds the lock."
   fi
   LOCK_ACQUIRED=1
   {

@@ -95,6 +95,7 @@ installations, and controlled tests:
 | UNITY_LICENSING_MODE_CONFIG_FILE | Use a configuration file at another path. |
 | UNITY_LICENSING_MODE_STATE_DIR | Store backups, templates, locks, and transaction metadata elsewhere. |
 | UNITY_LICENSING_MODE_LOCK_DIR | Override the operation-lock directory. |
+| UNITY_LICENSING_MODE_LOCK_INCOMPLETE_GRACE_SECONDS | Seconds to wait before recovering a lock with incomplete metadata (default 5). |
 | UNITY_LICENSING_MODE_USER_CONFIG_DIR | Override the Unity user configuration directory. |
 | UNITY_LICENSING_MODE_SYSTEM_CONFIG_DIR | Override the Unity system configuration directory. |
 | UNITY_LICENSING_MODE_LICENSE_DIR | Override the Unity license directory. |
@@ -154,6 +155,9 @@ when the configured CLI is a custom wrapper that reads the token from stdin.
 ## Safety model
 
 Mode-changing commands use an atomic directory lock under the state directory.
+If an invocation is interrupted while creating its lock metadata, a later real
+run recovers that incomplete lock only after a short grace period; dry runs
+never remove it. Locks with a readable live PID remain held.
 The personal and floating configuration changes also record metadata under:
 
 ~~~
