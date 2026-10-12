@@ -24,4 +24,38 @@ if "$SCRIPT" unsupported-command >/dev/null 2>&1; then
   exit 1
 fi
 
+# Exercise the production predicate without invoking mode changes or touching
+# real processes. The stub applies pgrep's regex to representative command lines.
+eval "$(sed -n '/^unity_running() {$/,/^}$/p' "$SCRIPT")"
+pgrep() {
+  [[ "$1" == "-f" ]]
+  printf '%s\n' "$TEST_PROCESS_COMMAND" | grep -Eq -- "$2"
+}
+
+for TEST_PROCESS_COMMAND in \
+  '/Applications/Unity Hub.app/Contents/MacOS/Unity Hub' \
+  '/Applications/Unity Hub.app/Contents/MacOS/Unity Hub --some-option' \
+  '/Applications/Unity/Hub/Editor/6000.2.9f1/Unity.app/Contents/MacOS/Unity -projectpath /tmp/project' \
+  '/Applications/Unity/Hub/Editor/6000.2.9f1/Unity.app/Contents/MacOS/Unity'; do
+  unity_running || { printf 'missed app executable: %s\n' "$TEST_PROCESS_COMMAND" >&2; exit 1; }
+done
+
+for TEST_PROCESS_COMMAND in \
+  '/Applications/Unity Hub.app/Contents/Frameworks/UnityLicensingClient_V1.app/Contents/MacOS/Unity.Licensing.Client' \
+  '/Applications/Unity Hub.app/Contents/Frameworks/Electron Framework.framework/Helpers/chrome_crashpad_handler' \
+  '/Applications/Unity Hub.app/Contents/Frameworks/Unity Hub Helper.app/Contents/MacOS/Unity Hub Helper' \
+  '/Applications/Unity/Hub/Editor/6000.2.9f1/Unity.app/Contents/Resources/PackageManager/Server/UnityPackageManager' \
+  '/Applications/Unity/Hub/Editor/6000.2.9f1/Unity.app/Contents/Tools/UnityShaderCompiler' \
+  '/bin/bash inspect /Applications/Unity Hub.app/Contents/MacOS/Unity Hub' \
+  '/bin/bash inspect /Applications/Unity/Hub/Editor/6000.2.9f1/Unity.app/Contents/MacOS/Unity' \
+  '/Applications/Unity Hub.app/Contents/MacOS/Unity HubOther' \
+  '/Applications/Unity/Hub/Editor/6000.2.9f1/UnityXapp/Contents/MacOS/Unity' \
+  '' \
+  '/Applications/Unity/Hub/Editor/6000.2.9f1/Unity.app/Contents/MacOS/UnityOther'; do
+  if unity_running; then
+    printf 'mistook helper or argument for an app: %s\n' "$TEST_PROCESS_COMMAND" >&2
+    exit 1
+  fi
+done
+
 printf 'command checks passed\n'
