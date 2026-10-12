@@ -625,7 +625,9 @@ verify_floating_config() {
 
 unity_running() {
   command -v pgrep >/dev/null 2>&1 || return 1
-  pgrep -f '/Applications/Unity Hub.app|/Applications/Unity/Hub/Editor/.*/Unity.app' >/dev/null 2>&1
+  # Match the app executables, not every helper inside their bundles. In
+  # particular, the Licensing Client is stopped separately after this check.
+  pgrep -f '^/Applications/Unity Hub[.]app/Contents/MacOS/Unity Hub( |$)|^/Applications/Unity/Hub/Editor/[^/]+/Unity[.]app/Contents/MacOS/Unity( |$)' >/dev/null 2>&1
 }
 
 licensing_client_pids() {
